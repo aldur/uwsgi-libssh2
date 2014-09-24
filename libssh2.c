@@ -1,12 +1,50 @@
 #include <uwsgi.h>
 #include <libssh2.h>
+#include <libssh2_sftp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-static int ssh_request_file(const char *hostaddr, uint32_t port, const char *scppath) {
+static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
+{
+    struct timeval timeout;
+    int rc;
+    fd_set fd;
+    fd_set *writefd = NULL;
+    fd_set *readfd = NULL;
+    int dir;
+
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+
+    FD_ZERO(&fd);
+
+    FD_SET(socket_fd, &fd);
+
+    /* now make sure we wait in the correct direction */
+    dir = libssh2_session_block_directions(session);
+
+
+    if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
+        readfd = &fd;
+
+    if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+        writefd = &fd;
+
+    rc = select(socket_fd + 1, readfd, writefd, NULL, &timeout);
+
+    return rc;
+}
+
+static int ssh_request_file(
+	const char *hostaddr,
+	uint32_t port,
+	const char *scppath,
+	void *file,
+	size_t *file_len) {
+
 	int auth_pw = 1;
 	const char *username = "vagrant";
 	const char *password = "vagrant";
@@ -44,10 +82,14 @@ static int ssh_request_file(const char *hostaddr, uint32_t port, const char *scp
 	    exit(1);
 	}
 
+	/* Since we have set non-blocking, tell libssh2 we are non-blocking */
+	libssh2_session_set_blocking(session, 0);
+
 	/* ... start it up. This will trade welcome banners, exchange keys,
 	 * and setup crypto, compression, and MAC layers
 	 */
-	rc = libssh2_session_handshake(session, sock);
+
+	while ((rc = libssh2_session_handshake(session, sock)) == LIBSSH2_ERROR_EAGAIN);
 	if (rc) {
 	    uwsgi_error("error on handshake");
 	    exit(1);
@@ -73,62 +115,101 @@ static int ssh_request_file(const char *hostaddr, uint32_t port, const char *scp
 	// printf("\n");
 
 	if (auth_pw) {
+		while ((rc = libssh2_userauth_password(session, username, password)) == LIBSSH2_ERROR_EAGAIN);
 	    /* We could authenticate via password */
-	    if (libssh2_userauth_password(session, username, password)) {
+	    if (rc) {
 	        uwsgi_error("Authentication by password failed.");
 	        goto shutdown;
 	    }
 	} else {
 	    /* Or by public key */
-	    // FIXME
-	    if (libssh2_userauth_publickey_fromfile(
-		    	session,
-		    	username,
-		        "/home/username/.ssh/id_rsa.pub",
-		        "/home/username/.ssh/id_rsa",
-		        password)
-	    	)
-	    {
+	    // FIXME: keys path!
+	    while ((rc = libssh2_userauth_publickey_fromfile(
+		    		session, username,
+	                "/home/username/"
+	                ".ssh/id_rsa.pub",
+	                "/home/username/"
+	                ".ssh/id_rsa",
+                	password)
+	    ) == LIBSSH2_ERROR_EAGAIN);
+	    if (rc) {
 	        uwsgi_error("\tAuthentication by public key failed\n");
 	        goto shutdown;
 	    }
 	}
 
+	LIBSSH2_SFTP *sftp_session = NULL;
+	do {
+	    sftp_session = libssh2_sftp_init(session);
+
+	    if (!sftp_session) {
+	        if (libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
+	            uwsgi_error("non-blocking init\n");
+	            waitsocket(sock, session); /* now we wait */
+	        } else {
+	            uwsgi_error("Unable to init SFTP session\n");
+	            goto shutdown;
+	        }
+	    }
+	} while (!sftp_session);
+
 	/* Request a file via SCP */
-	LIBSSH2_CHANNEL *channel;
-	struct stat fileinfo;
-	uwsgi_log("MODE: %d", fileinfo.st_mode);
-	channel = libssh2_scp_recv(session, scppath, &fileinfo);
-	uwsgi_log("MODE: %d", fileinfo.st_mode);
+	// LIBSSH2_SFTP *sftp_session = libssh2_sftp_init(session);
 
-	if (!channel) {
-		uwsgi_error("Unable to open a session");
-		goto shutdown;
-	}
+	// if (!sftp_session) {
+	//     fprintf(stderr, "Unable to init SFTP session\n");
+	//     goto shutdown;
+	// }
 
-	off_t got = 0;
-    char mem[1024];
-	while (got < fileinfo.st_size) {
-	    int amount = sizeof(mem);
+	/* Request a file via SFTP */
+	LIBSSH2_SFTP_HANDLE *sftp_handle = NULL;
+	do {
+	    sftp_handle = libssh2_sftp_open(sftp_session, scppath, LIBSSH2_FXF_READ, 0);
 
-	    if ((fileinfo.st_size - got) < amount) {
-	        amount = fileinfo.st_size - got;
+	    if (!sftp_handle) {
+	        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+	            uwsgi_error("Unable to open file with SFTP\n");
+	            goto shutdown;
+	        } else {
+	            uwsgi_log("non-blocking open\n");
+	            waitsocket(sock, session); /* now we wait */
+	        }
 	    }
+	} while (!sftp_handle);
 
-	    rc = libssh2_channel_read(channel, mem, amount);
+	size_t buffer_size = 1024;
+	void *buffer = uwsgi_malloc(buffer_size);
 
-	    if (rc > 0) {
-	        write(1, mem, rc);
-	    }
-	    else if (rc < 0) {
-	        uwsgi_error("libssh2_channel_read() failed");
-	        break;
-	    }
-	    got += rc;
-	}
+	size_t f_len = 0;
+	void *f = NULL;  // let's start slow!
+	do {
+		rc = libssh2_sftp_read(sftp_handle, buffer, buffer_size);
+		uwsgi_log("%d\n", rc);
 
-	libssh2_channel_free(channel);
-	channel = NULL;
+		if (rc == LIBSSH2_ERROR_EAGAIN) {
+			// uwsgi_log("EAGAIN!");
+			waitsocket(sock, session);
+		} else if (rc <= 0) {
+			// TODO: error checking!
+			// We're done here!
+		    break;
+		} else {
+		    f_len += rc;
+		    if ((f = realloc(f, f_len)) == NULL) {
+		    	uwsgi_error("error on realloc");
+		    	exit(1);
+		    }
+		    memcpy(f + (f_len - rc), buffer, rc);
+		}
+	} while (1);
+
+	*file_len = f_len;
+	file = f;
+
+	uwsgi_log("%s, %d\n", f, f_len);
+
+	libssh2_sftp_close(sftp_handle);
+	libssh2_sftp_shutdown(sftp_session);
 
 shutdown:
 	libssh2_session_disconnect(session, "Normal Shutdown, Thank you for playing");
@@ -162,7 +243,11 @@ static int ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 	uwsgi_log("Data3: %s\n", ur->data3);
 
 	int port = atoi(ur->data2);
-	ssh_request_file(ur->data, port, ur->data3);
+
+	void *file = NULL;
+	size_t size = 0;
+	int f = ssh_request_file(ur->data, port, ur->data3, file, &size);
+	uwsgi_log("%d", f);
 
 	// uwsgi_log("SSH Request!\n");
 	return 0;
