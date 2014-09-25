@@ -5,9 +5,26 @@ extern struct uwsgi_server uwsgi;
 #include <libssh2_sftp.h>
 
 #define BUFFER_SIZE 1024
-#define USER "vagrant"
-#define PASSWORD "vagrant"
 
+struct uwsgi_libssh2 {
+	int auth_pw;
+	char *username;
+	char *password;
+	char *public_key_path;
+	char *private_key_path;
+	char *private_key_passphrase;
+} ulibssh2;
+
+static struct uwsgi_option libssh2_options[] = {
+	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
+	{"ssh-password-auth", no_argument, 0, "enable ssh password authentication", uwsgi_opt_true, &ulibssh2.auth_pw, 0},
+	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
+	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
+	{"public-key-path", required_argument, 0, "path of id_rsa.pub file", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
+	{"private-key-path", required_argument, 0, "path of id_rsa file", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
+	{"private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
+	UWSGI_END_OF_OPTIONS
+};
 
 static void waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 {
@@ -29,10 +46,6 @@ static void waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 }
 
 static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **session) {
-	int auth_pw = 1;
-	const char *username = USER;
-	const char *password = PASSWORD;
-
 	int sock = uwsgi_connect(remoteaddr, uwsgi.socket_timeout, 1);
 	if (sock < 0) {
 		uwsgi_error("init_ssh_session()/uwsgi_connect()");
@@ -68,8 +81,8 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 		goto shutdown;
 	}
 
-	if (auth_pw) {
-		while ((rc = libssh2_userauth_password(*session, username, password)) == LIBSSH2_ERROR_EAGAIN) {
+	if (ulibssh2.auth_pw) {
+		while ((rc = libssh2_userauth_password(*session, ulibssh2.username, ulibssh2.password)) == LIBSSH2_ERROR_EAGAIN) {
 			waitsocket(sock, *session);
 		}
 		if (rc) {
@@ -77,15 +90,13 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 	} else {
-		// FIXME: keys path!
+		// TODO: Test me!
 		while ((rc = libssh2_userauth_publickey_fromfile(
 					*session,
-					username,
-					"/home/username/"
-					".ssh/id_rsa.pub",
-					"/home/username/"
-					".ssh/id_rsa",
-					password)
+					ulibssh2.username,
+					ulibssh2.public_key_path,
+					ulibssh2.private_key_path,
+					ulibssh2.private_key_passphrase)
 		) == LIBSSH2_ERROR_EAGAIN) {
 			waitsocket(sock, *session);
 		}
@@ -140,6 +151,7 @@ static int ssh_request_file(
 		waitsocket(sock, session);
 	}
 	if (rc < 0) {
+		uwsgi_log("DEBUG: %d", rc == LIBSSH2_ERROR_EAGAIN);
 		uwsgi_error("ssh_request_file()/libssh2_sftp_stat()");
 		goto shutdown;
 	}
@@ -179,7 +191,7 @@ static int ssh_request_file(
 				uwsgi_error("ssh_request_file()/libssh2_sftp_open()");
 				goto shutdown;
 			} else {
-				waitsocket(sock, session); /* now we wait */
+				waitsocket(sock, session);
 			}
 		}
 	} while (!sftp_handle);
@@ -255,13 +267,14 @@ static int ssh_router(struct uwsgi_route *ur, char *args) {
 
 static void register_ssh_router(void) {
 	// FIXME: Change me when you have proper options handling
-	uwsgi.build_mime_dict = 1;
+	// uwsgi.build_mime_dict = 1;
 	uwsgi_register_router("ssh", ssh_router);
 }
 #endif
 
 struct uwsgi_plugin libssh2_plugin = {
 	.name = "libssh2",
+	.options = libssh2_options,
 #ifdef UWSGI_ROUTING
 	.on_load = register_ssh_router,
 #endif
