@@ -20,9 +20,9 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-password-auth", no_argument, 0, "enable ssh password authentication", uwsgi_opt_true, &ulibssh2.auth_pw, 0},
 	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
 	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
-	{"public-key-path", required_argument, 0, "path of id_rsa.pub file", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
-	{"private-key-path", required_argument, 0, "path of id_rsa file", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
-	{"private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
+	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
+	{"ssh-private-key-path", required_argument, 0, "path of id_rsa file", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
+	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
 	UWSGI_END_OF_OPTIONS
 };
 
@@ -90,7 +90,6 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 	} else {
-		// TODO: Test me!
 		while ((rc = libssh2_userauth_publickey_fromfile(
 					*session,
 					ulibssh2.username,
@@ -136,7 +135,7 @@ static int ssh_request_file(
 
 		if (!sftp_session) {
 			if (libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
-				waitsocket(sock, session); /* now we wait */
+				waitsocket(sock, session);
 			} else {
 				uwsgi_error("ssh_request_file()/libssh2_sftp_init()");
 				goto shutdown;
@@ -151,12 +150,12 @@ static int ssh_request_file(
 		waitsocket(sock, session);
 	}
 	if (rc < 0) {
-		uwsgi_log("DEBUG: %d", rc == LIBSSH2_ERROR_EAGAIN);
+		// If it fails, requested file could not exist.
+		// (TODO, how to discriminate various error code?)
 		uwsgi_error("ssh_request_file()/libssh2_sftp_stat()");
 		goto shutdown;
 	}
 
-	// TODO: Error codes!
 	if (uwsgi_response_prepare_headers(wsgi_req, "200 OK", 6)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_prepare_headers()");
 		goto shutdown;
@@ -243,10 +242,7 @@ shutdown:
 
 #ifdef UWSGI_ROUTING
 static int ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	if (ssh_request_file(wsgi_req, ur)) {
-		uwsgi_error("error while requesting file");
-	}
-
+	ssh_request_file(wsgi_req, ur);
 	return 0;
 }
 
@@ -266,8 +262,6 @@ static int ssh_router(struct uwsgi_route *ur, char *args) {
 }
 
 static void register_ssh_router(void) {
-	// FIXME: Change me when you have proper options handling
-	// uwsgi.build_mime_dict = 1;
 	uwsgi_register_router("ssh", ssh_router);
 }
 #endif
