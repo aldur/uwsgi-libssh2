@@ -98,7 +98,7 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 
-		char *remoteaddr_str = uwsgi_strncopy(remoteaddr, strlen(remoteaddr) + 1);
+		char *remoteaddr_str = uwsgi_strncopy(remoteaddr, strlen(remoteaddr));
 		char *port_str = strchr(remoteaddr_str, ':');
 		int port = SSH_DEFAULT_PORT;
 
@@ -164,7 +164,6 @@ shutdown:
 
 static int ssh_request_file(
 	struct wsgi_request *wsgi_req,
-	// struct uwsgi_route *ur
 	char* remoteaddr,
 	char* filepath
 	) {
@@ -191,6 +190,8 @@ static int ssh_request_file(
 			}
 		}
 	} while (!sftp_session);
+
+	uwsgi_log("DEBUG: filepath %s\n", filepath);
 
 	// Request file stats via SFTP
 	LIBSSH2_SFTP_ATTRIBUTES file_attrs;
@@ -327,25 +328,25 @@ static void register_ssh_router(void) {
 }
 #endif
 
-// static int ssh_request(struct wsgi_request *wsgi_req) {
-// 	if (!wsgi_req->len) {
-// 		uwsgi_log("Empty request. Skip.\n");
-// 		return -1;
-// 	}
+static int ssh_request(struct wsgi_request *wsgi_req) {
+	if (!wsgi_req->len) {
+		uwsgi_log("Empty request. Skip.\n");
+		return -1;
+	}
 
-// 	if (uwsgi_parse_vars(wsgi_req)) {
-// 		uwsgi_error("ssh_request()/uwsgi_parse_vars()");
-// 		return -1;
-// 	}
+	if (uwsgi_parse_vars(wsgi_req)) {
+		uwsgi_error("ssh_request()/uwsgi_parse_vars()");
+		return -1;
+	}
 
-// 	char *remoteaddr= "127.0.0.1:2222";
-// 	char *filepath = wsgi_req->uri;
+	char *remoteaddr= "127.0.0.1:2222";
+	char *filepath = uwsgi_strncopy(wsgi_req->uri, wsgi_req->uri_len);
 
-// 	uwsgi_log("DEBUG: filepath %s\n", filepath);
+	ssh_request_file(wsgi_req, remoteaddr, filepath);
 
-// 	ssh_request_file(wsgi_req, remoteaddr, filepath);
-// 	return 0;
-// }
+	free(filepath);
+	return 0;
+}
 
 static int uwsgi_libssh2_init() {
 	char *home = getenv("HOME");
@@ -391,7 +392,7 @@ struct uwsgi_plugin libssh2_plugin = {
 	.name = "libssh2",
 	.options = libssh2_options,
 	.init = uwsgi_libssh2_init,
-	// .request = ssh_request,
+	.request = ssh_request,
 #ifdef UWSGI_ROUTING
 	.on_load = register_ssh_router,
 #endif
