@@ -4,7 +4,6 @@ extern struct uwsgi_server uwsgi;
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 
-#define BUFFER_SIZE 1024
 #define SSH_DEFAULT_PORT 22
 
 struct uwsgi_libssh2 {
@@ -196,26 +195,34 @@ static int ssh_request_file(
 	while ((rc = libssh2_sftp_stat(sftp_session, scppath, &file_attrs)) == LIBSSH2_ERROR_EAGAIN) {
 		waitsocket(sock, session);
 	}
+
 	if (rc < 0) {
 		// If it fails, requested file could not exist.
-		// (TODO, how to discriminate various error code?)
-		uwsgi_error("ssh_request_file()/libssh2_sftp_stat()");
-		goto shutdown;
+		if (rc == LIBSSH2_ERROR_SFTP_PROTOCOL) {
+			if (libssh2_sftp_last_error(sftp_session) == LIBSSH2_FX_NO_SUCH_FILE) {
+				uwsgi_404(wsgi_req);
+			}
+			goto sftp_shutdown;
+		} else {
+			uwsgi_error("ssh_request_file()/libssh2_sftp_stat()");
+			uwsgi_500(wsgi_req);
+		}
+		goto sftp_shutdown;
 	}
 
 	if (uwsgi_response_prepare_headers(wsgi_req, "200", 3)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_prepare_headers()");
-		goto shutdown;
+		goto sftp_shutdown;
 	}
 
 	if (uwsgi_response_add_content_length(wsgi_req, file_attrs.filesize)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_add_content_length()");
-		goto shutdown;
+		goto sftp_shutdown;
 	}
 
 	if (uwsgi_response_add_last_modified(wsgi_req, file_attrs.mtime)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_add_last_modified()");
-		goto shutdown;
+		goto sftp_shutdown;
 	}
 
 	size_t mime_type_len = 0;
@@ -223,11 +230,11 @@ static int ssh_request_file(
 	if (mime_type) {
 		if (uwsgi_response_add_content_type(wsgi_req, mime_type, mime_type_len)) {
 			uwsgi_error("ssh_request_file()/uwsgi_response_add_content_type()");
-			goto shutdown;
+			// goto sftp_shutdown;
 		}
 	}
 
-	/* Request a file via SFTP */
+	// Request a file via SFTP
 	LIBSSH2_SFTP_HANDLE *sftp_handle = NULL;
 	do {
 		sftp_handle = libssh2_sftp_open(sftp_session, scppath, LIBSSH2_FXF_READ, 0);
@@ -235,14 +242,14 @@ static int ssh_request_file(
 		if (!sftp_handle) {
 			if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
 				uwsgi_error("ssh_request_file()/libssh2_sftp_open()");
-				goto shutdown;
+				goto sftp_shutdown;
 			} else {
 				waitsocket(sock, session);
 			}
 		}
 	} while (!sftp_handle);
 
-	size_t buffer_size = BUFFER_SIZE;
+	size_t buffer_size = uwsgi.page_size;
 	void *buffer = alloca(buffer_size);
 	libssh2_uint64_t read_size = 0;
 
@@ -270,6 +277,7 @@ static int ssh_request_file(
 		uwsgi_error("ssh_request_file()/libssh2_sftp_close()");
 	}
 
+sftp_shutdown:
 	while ((rc = libssh2_sftp_shutdown(sftp_session)) == LIBSSH2_ERROR_EAGAIN) {
 		waitsocket(sock, session);
 	};
