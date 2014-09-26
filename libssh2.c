@@ -98,7 +98,8 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 
-		char *port_str = strchr(remoteaddr, ':');
+		char *remoteaddr_str = uwsgi_strncopy(remoteaddr, strlen(remoteaddr) + 1);
+		char *port_str = strchr(remoteaddr_str, ':');
 		int port = SSH_DEFAULT_PORT;
 
 		if (port_str) {
@@ -110,7 +111,7 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 		struct libssh2_knownhost *host;
 		int check = libssh2_knownhost_checkp(
 			nh,
-			remoteaddr,
+			remoteaddr_str,
 			port,
 			fingerprint,
 			len,
@@ -118,8 +119,10 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			&host
 		);
 
+		free(remoteaddr_str);
+
 		if (check != LIBSSH2_KNOWNHOST_CHECK_MATCH) {
-			uwsgi_log("remote fingerprint check failed!");
+			uwsgi_log("Remote fingerprint check failed!\n");
 			libssh2_knownhost_free(nh);
 			goto shutdown;
 		}
@@ -161,17 +164,17 @@ shutdown:
 
 static int ssh_request_file(
 	struct wsgi_request *wsgi_req,
-	struct uwsgi_route *ur
+	// struct uwsgi_route *ur
+	char* remoteaddr,
+	char* filepath
 	) {
-
-	char *remoteaddr = ur->data;
-	char *scppath = ur->data2;
 
 	int sock = -1;
 
 	LIBSSH2_SESSION *session = NULL;
 	if (init_ssh_session(remoteaddr, &sock, &session)) {
-		uwsgi_error("ssh_request_file()/init_ssh_session()");
+		uwsgi_log("SSH session initialization failed.\n");
+		// uwsgi_error("ssh_request_file()/init_ssh_session()");
 		goto shutdown;
 	}
 
@@ -192,7 +195,7 @@ static int ssh_request_file(
 	// Request file stats via SFTP
 	LIBSSH2_SFTP_ATTRIBUTES file_attrs;
 	int rc;
-	while ((rc = libssh2_sftp_stat(sftp_session, scppath, &file_attrs)) == LIBSSH2_ERROR_EAGAIN) {
+	while ((rc = libssh2_sftp_stat(sftp_session, filepath, &file_attrs)) == LIBSSH2_ERROR_EAGAIN) {
 		waitsocket(sock, session);
 	}
 
@@ -226,7 +229,7 @@ static int ssh_request_file(
 	}
 
 	size_t mime_type_len = 0;
-	char *mime_type = uwsgi_get_mime_type(scppath, strlen(scppath), &mime_type_len);
+	char *mime_type = uwsgi_get_mime_type(filepath, strlen(filepath), &mime_type_len);
 	if (mime_type) {
 		if (uwsgi_response_add_content_type(wsgi_req, mime_type, mime_type_len)) {
 			uwsgi_error("ssh_request_file()/uwsgi_response_add_content_type()");
@@ -237,7 +240,7 @@ static int ssh_request_file(
 	// Request a file via SFTP
 	LIBSSH2_SFTP_HANDLE *sftp_handle = NULL;
 	do {
-		sftp_handle = libssh2_sftp_open(sftp_session, scppath, LIBSSH2_FXF_READ, 0);
+		sftp_handle = libssh2_sftp_open(sftp_session, filepath, LIBSSH2_FXF_READ, 0);
 
 		if (!sftp_handle) {
 			if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
@@ -297,7 +300,10 @@ shutdown:
 
 #ifdef UWSGI_ROUTING
 static int ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	ssh_request_file(wsgi_req, ur);
+	char *remoteaddr = ur->data;
+	char *filepath = ur->data2;
+
+	ssh_request_file(wsgi_req, remoteaddr, filepath);
 	return 0;
 }
 
@@ -320,6 +326,26 @@ static void register_ssh_router(void) {
 	uwsgi_register_router("ssh", ssh_router);
 }
 #endif
+
+// static int ssh_request(struct wsgi_request *wsgi_req) {
+// 	if (!wsgi_req->len) {
+// 		uwsgi_log("Empty request. Skip.\n");
+// 		return -1;
+// 	}
+
+// 	if (uwsgi_parse_vars(wsgi_req)) {
+// 		uwsgi_error("ssh_request()/uwsgi_parse_vars()");
+// 		return -1;
+// 	}
+
+// 	char *remoteaddr= "127.0.0.1:2222";
+// 	char *filepath = wsgi_req->uri;
+
+// 	uwsgi_log("DEBUG: filepath %s\n", filepath);
+
+// 	ssh_request_file(wsgi_req, remoteaddr, filepath);
+// 	return 0;
+// }
 
 static int uwsgi_libssh2_init() {
 	char *home = getenv("HOME");
@@ -365,8 +391,8 @@ struct uwsgi_plugin libssh2_plugin = {
 	.name = "libssh2",
 	.options = libssh2_options,
 	.init = uwsgi_libssh2_init,
+	// .request = ssh_request,
 #ifdef UWSGI_ROUTING
 	.on_load = register_ssh_router,
 #endif
-	// .request = request_handler,
 };
