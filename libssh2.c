@@ -30,23 +30,25 @@ static struct uwsgi_option libssh2_options[] = {
 	UWSGI_END_OF_OPTIONS
 };
 
-static void waitsocket(int socket_fd, LIBSSH2_SESSION *session)
+static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 {
 	int dir = libssh2_session_block_directions(session);
 
 	if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
 		if (uwsgi.wait_read_hook(socket_fd, uwsgi.socket_timeout) < 0) {
 			uwsgi_error("waitsocket()/wait_read_hook()");
+			return -1;
 		}
 	}
 
 	if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
 		if (uwsgi.wait_write_hook(socket_fd, uwsgi.socket_timeout) < 0) {
 			uwsgi_error("waitsocket()/wait_write_hook()");
+			return -1;
 		}
 	}
 
-	return;
+	return 0;
 }
 
 static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **session) {
@@ -98,7 +100,7 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 
-		char *remoteaddr_str = uwsgi_strncopy(remoteaddr, strlen(remoteaddr));
+		char *remoteaddr_str = uwsgi_str(remoteaddr);
 		char *port_str = strchr(remoteaddr_str, ':');
 		int port = SSH_DEFAULT_PORT;
 
@@ -190,8 +192,6 @@ static int ssh_request_file(
 			}
 		}
 	} while (!sftp_session);
-
-	uwsgi_log("DEBUG: filepath %s\n", filepath);
 
 	// Request file stats via SFTP
 	LIBSSH2_SFTP_ATTRIBUTES file_attrs;
@@ -339,8 +339,9 @@ static int ssh_request(struct wsgi_request *wsgi_req) {
 		return -1;
 	}
 
+	// TODO: add SSH mirroring?
 	char *remoteaddr= "127.0.0.1:2222";
-	char *filepath = uwsgi_strncopy(wsgi_req->uri, wsgi_req->uri_len);
+	char *filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
 
 	ssh_request_file(wsgi_req, remoteaddr, filepath);
 
