@@ -15,6 +15,7 @@ struct uwsgi_libssh2 {
 	char *private_key_passphrase;
 	int check_remote_fingerpint;
 	char *known_hosts_path;
+	int ssh_timeout;
 } ulibssh2;
 
 static struct uwsgi_option libssh2_options[] = {
@@ -27,6 +28,7 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
 	{"ssh-check-remote-fingerpint", no_argument, 0, "enable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.check_remote_fingerpint, 0},
 	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
+	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
 	UWSGI_END_OF_OPTIONS
 };
 
@@ -35,14 +37,14 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 	int dir = libssh2_session_block_directions(session);
 
 	if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-		if (uwsgi.wait_read_hook(socket_fd, uwsgi.socket_timeout) < 0) {
+		if (uwsgi.wait_read_hook(socket_fd, ulibssh2.ssh_timeout) < 0) {
 			uwsgi_error("waitsocket()/wait_read_hook()");
 			return -1;
 		}
 	}
 
 	if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-		if (uwsgi.wait_write_hook(socket_fd, uwsgi.socket_timeout) < 0) {
+		if (uwsgi.wait_write_hook(socket_fd, ulibssh2.ssh_timeout) < 0) {
 			uwsgi_error("waitsocket()/wait_write_hook()");
 			return -1;
 		}
@@ -52,7 +54,7 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 }
 
 static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **session) {
-	int sock = uwsgi_connect(remoteaddr, uwsgi.socket_timeout, 1);
+	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
 	if (sock < 0) {
 		uwsgi_error("init_ssh_session()/uwsgi_connect()");
 		return 1;
@@ -384,6 +386,10 @@ static int uwsgi_libssh2_init() {
 
 	if (!ulibssh2.known_hosts_path) {
 		ulibssh2.known_hosts_path = uwsgi_concat2(home, "/.ssh/known_hosts");
+	}
+
+	if (!ulibssh2.ssh_timeout) {
+		ulibssh2.ssh_timeout = uwsgi.socket_timeout;
 	}
 
 	return 0;
