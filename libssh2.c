@@ -8,6 +8,7 @@ extern struct uwsgi_server uwsgi;
 
 struct uwsgi_libssh2 {
 	int auth_pw;
+	int auth_ssh_agent;
 	char *username;
 	char *password;
 	char *public_key_path;
@@ -16,11 +17,13 @@ struct uwsgi_libssh2 {
 	int check_remote_fingerpint;
 	char *known_hosts_path;
 	int ssh_timeout;
+	char *ssh_custom_agent;
 } ulibssh2;
 
 static struct uwsgi_option libssh2_options[] = {
 	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
 	{"ssh-password-auth", no_argument, 0, "enable ssh password authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_pw, 0},
+	{"ssh-agent", no_argument, 0, "enable ssh-agent authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_ssh_agent, 0},
 	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
 	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
 	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file (default ~/.ssh/id_rsa.pub)", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
@@ -29,6 +32,7 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-check-remote-fingerpint", no_argument, 0, "enable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.check_remote_fingerpint, 0},
 	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
 	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
+	{"ssh-custom-agent", required_argument, 0, "ssh agent used to ask the users the ssh password", uwsgi_opt_set_str, &ulibssh2.ssh_custom_agent, 0},
 	UWSGI_END_OF_OPTIONS
 };
 
@@ -51,6 +55,64 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 	}
 
 	return 0;
+}
+
+static int ssh_agent_auth(LIBSSH2_SESSION *session, char* username) {
+	// TODO: Test me!
+
+	LIBSSH2_AGENT *agent = libssh2_agent_init(session);
+
+	if (!agent) {
+		uwsgi_error("ssh_agent_auth()/libssh2_agent_init()");
+	    goto shutdown;
+	}
+
+	if (libssh2_agent_connect(agent)) {
+		uwsgi_error("ssh_agent_auth()/libssh2_agent_connect()")
+	    goto shutdown;
+	}
+
+	if (libssh2_agent_list_identities(agent)) {
+		uwsgi_error("ssh_agent_auth()/libssh2_agent_list_identities()")
+	    goto shutdown;
+	}
+
+	struct libssh2_agent_publickey *identity, *prev_identity = NULL;
+	int rc = 0;
+
+	while (1) {
+	    rc = libssh2_agent_get_identity(agent, &identity, prev_identity);
+
+	    if (rc == 1) {
+            uwsgi_log("SSH agent couldn't continue authentication.\n");
+            goto shutdown;
+	    } else if (rc < 0) {
+	        uwsgi_error("ssh_agent_auth()/libssh2_agent_get_identity()");
+	        goto shutdown;
+	    }
+
+	    if (libssh2_agent_userauth(agent, username, identity)) {
+	    	uwsgi_log("SSH agent failed authenticating user %s with public key %s\n",
+	    		username, identity->comment);
+	    } else {
+	    	// we're done!
+	        break;
+	    }
+	    prev_identity = identity;
+	}
+
+
+	/* We're authenticated now. */
+	libssh2_agent_disconnect(agent);
+	libssh2_agent_free(agent);
+
+	return 0;
+
+shutdown:
+
+	libssh2_agent_disconnect(agent);
+	libssh2_agent_free(agent);
+	return -1;
 }
 
 static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **session) {
@@ -135,12 +197,20 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 	}
 
 	if (ulibssh2.auth_pw) {
-		while ((rc = libssh2_userauth_password(*session, ulibssh2.username, ulibssh2.password)) == LIBSSH2_ERROR_EAGAIN) {
+		while ((rc = libssh2_userauth_password(
+					*session,
+					ulibssh2.username,
+					ulibssh2.password)
+			) == LIBSSH2_ERROR_EAGAIN) {
 			waitsocket(sock, *session);
 		}
 		if (rc) {
 			uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
 			goto shutdown;
+		}
+	} else if (ulibssh2.auth_ssh_agent) {
+		if (ssh_agent_auth(*session, ulibssh2.username)) {
+			uwsgi_error("init_ssh_session()/ssh_agent_auth()");
 		}
 	} else {
 		while ((rc = libssh2_userauth_publickey_fromfile(
@@ -215,6 +285,15 @@ static int ssh_request_file(
 		}
 		goto sftp_shutdown;
 	}
+
+	// if (wsgi_req->if_modified_since_len) {
+	// 	time_t ims = parse_http_date(wsgi_req->if_modified_since, wsgi_req->if_modified_since_len);
+	// 	if (st->st_mtime <= ims) {
+	// 		if (uwsgi_response_prepare_headers(wsgi_req, "304 Not Modified", 16))
+	// 			return -1;
+	// 		return uwsgi_response_write_headers_do(wsgi_req);
+	// 	}
+	// }
 
 	if (uwsgi_response_prepare_headers(wsgi_req, "200", 3)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_prepare_headers()");
