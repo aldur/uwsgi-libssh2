@@ -18,7 +18,108 @@ struct uwsgi_libssh2 {
 	char *known_hosts_path;
 	int ssh_timeout;
 	char *ssh_custom_agent;
+	struct uwsgi_string_list *mountpoints;
 } ulibssh2;
+
+struct ssh_mountpoint {
+	char *mountpoint;
+	char *remote;
+	char *username;
+	char *password;
+};
+
+#if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
+// uWSGI < 2.1
+time_t uwsgi_parse_http_date(char *date, uint16_t len) {
+	        struct tm hdtm;
+
+	        if (len != 29 && date[3] != ',')
+	                return 0;
+
+	        hdtm.tm_mday = uwsgi_str2_num(date + 5);
+
+	        switch (date[8]) {
+	        case 'J':
+	                if (date[9] == 'a') {
+	                        hdtm.tm_mon = 0;
+	                        break;
+	                }
+
+	                if (date[9] == 'u') {
+	                        if (date[10] == 'n') {
+	                                hdtm.tm_mon = 5;
+	                                break;
+	                        }
+
+	                        if (date[10] == 'l') {
+	                                hdtm.tm_mon = 6;
+	                                break;
+	                        }
+
+	                        return 0;
+	                }
+
+	                return 0;
+
+	        case 'F':
+	                hdtm.tm_mon = 1;
+	                break;
+
+	        case 'M':
+	                if (date[9] != 'a')
+	                        return 0;
+
+	                if (date[10] == 'r') {
+	                        hdtm.tm_mon = 2;
+	                        break;
+	                }
+
+	                if (date[10] == 'y') {
+	                        hdtm.tm_mon = 4;
+	                        break;
+	                }
+
+	                return 0;
+
+	        case 'A':
+	                if (date[10] == 'r') {
+	                        hdtm.tm_mon = 3;
+	                        break;
+	                }
+	                if (date[10] == 'g') {
+	                        hdtm.tm_mon = 7;
+	                        break;
+	                }
+	                return 0;
+
+	        case 'S':
+	                hdtm.tm_mon = 8;
+	                break;
+
+	        case 'O':
+	                hdtm.tm_mon = 9;
+	                break;
+
+	        case 'N':
+	                hdtm.tm_mon = 10;
+			break;
+
+	        case 'D':
+	                hdtm.tm_mon = 11;
+	                break;
+	        default:
+	                return 0;
+	        }
+
+	        hdtm.tm_year = uwsgi_str4_num(date + 12) - 1900;
+
+	        hdtm.tm_hour = uwsgi_str2_num(date + 17);
+	        hdtm.tm_min = uwsgi_str2_num(date + 20);
+	        hdtm.tm_sec = uwsgi_str2_num(date + 23);
+
+	        return timegm(&hdtm);
+}
+#endif
 
 static struct uwsgi_option libssh2_options[] = {
 	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
@@ -33,11 +134,57 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
 	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
 	{"ssh-custom-agent", required_argument, 0, "ssh agent used to ask the users the ssh password", uwsgi_opt_set_str, &ulibssh2.ssh_custom_agent, 0},
+	{"ssh-mount", required_argument, 0, "virtual mount the specified ssh volume in a uri", uwsgi_opt_add_string_list, &ulibssh2.mountpoints, UWSGI_OPT_MIME},
 	UWSGI_END_OF_OPTIONS
 };
 
-static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
-{
+static void ssh_add_mountpoint(char *arg, size_t arg_len) {
+	// --ssh-mount mountpoint=/foo,remote=127.0.0.1:2222,user=vagrant,password=vagrant
+
+	struct ssh_mountpoint *sshmp = uwsgi_calloc(sizeof(struct ssh_mountpoint));
+
+	if (uwsgi_kvlist_parse(arg, arg_len, ',', '=',
+			"mountpoint", &sshmp->mountpoint,
+			"remote", &sshmp->remote,
+			"user", &sshmp->username,
+			"password", &sshmp->password,
+			NULL)
+		){
+		uwsgi_log("[SSH] unable to parse ssh mountpoint definition\n");
+		goto shutdown;
+	}
+
+	time_t now = uwsgi_now();
+	uwsgi_log("[SSH] mounting %s on %s\n", sshmp->remote, sshmp->mountpoint);
+
+	int id = uwsgi_apps_cnt;
+	struct uwsgi_app *ua = uwsgi_add_app(
+		id,
+		uwsgi.http_modifier1,
+		sshmp->mountpoint,
+		strlen(sshmp->mountpoint),
+		NULL,
+		NULL
+	);
+
+	if (!ua) {
+		uwsgi_log("[SSH] unable to mount %s\n", sshmp->mountpoint);
+		goto shutdown;
+	}
+
+	ua->responder0 = sshmp;
+	ua->started_at = now;
+	ua->startup_time = uwsgi_now() - now;
+	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %p\n", id, sshmp->remote, (int) ua->startup_time, sshmp->mountpoint);
+
+	return;
+
+shutdown:
+	free(sshmp);
+	exit(1);
+}
+
+static int waitsocket(int socket_fd, LIBSSH2_SESSION *session) {
 	int dir = libssh2_session_block_directions(session);
 
 	if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
@@ -96,7 +243,7 @@ static int ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* username) {
 		}
 
 	    if (rc) {
-	    	uwsgi_log("[SSH] agent failed authenticating user %s with public key %s\n",
+	    	uwsgi_log("[SSH] agent failed authenticating user %s with public key %s. Continuing...\n",
 	    		username, identity->comment);
 	    } else {
 	        break;
@@ -116,7 +263,13 @@ shutdown:
 	return -1;
 }
 
-static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **session) {
+static int init_ssh_session(
+		char* remoteaddr,
+		char* username,
+		char* password,
+		int *socket_fd,
+		LIBSSH2_SESSION **session) {
+
 	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
 	if (sock < 0) {
 		uwsgi_error("init_ssh_session()/uwsgi_connect()");
@@ -197,39 +350,56 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 		libssh2_knownhost_free(nh);
 	}
 
-	if (ulibssh2.auth_pw) {
-		while ((rc = libssh2_userauth_password(
-					*session,
-					ulibssh2.username,
-					ulibssh2.password)
-			) == LIBSSH2_ERROR_EAGAIN) {
-			waitsocket(sock, *session);
-		}
-		if (rc) {
-			uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
-			goto shutdown;
-		}
-	} else if (ulibssh2.auth_ssh_agent) {
-		if (ssh_agent_auth(*session, sock, ulibssh2.username)) {
-			uwsgi_error("init_ssh_session()/ssh_agent_auth()");
+	if (username && password) {
+		if (ulibssh2.auth_pw) {
+			while ((rc = libssh2_userauth_password(
+						*session,
+						username,
+						password)
+				) == LIBSSH2_ERROR_EAGAIN) {
+				waitsocket(sock, *session);
+			}
+
+			if (rc) {
+				uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
+				goto shutdown;
+			}
 		}
 	} else {
-		while ((rc = libssh2_userauth_publickey_fromfile(
-					*session,
-					ulibssh2.username,
-					ulibssh2.public_key_path,
-					ulibssh2.private_key_path,
-					ulibssh2.private_key_passphrase)
-		) == LIBSSH2_ERROR_EAGAIN) {
-			waitsocket(sock, *session);
-		}
+		if (ulibssh2.auth_pw) {
+			while ((rc = libssh2_userauth_password(
+						*session,
+						ulibssh2.username,
+						ulibssh2.password)
+				) == LIBSSH2_ERROR_EAGAIN) {
+				waitsocket(sock, *session);
+			}
+			if (rc) {
+				uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
+				goto shutdown;
+			}
+		} else if (ulibssh2.auth_ssh_agent) {
+			if (ssh_agent_auth(*session, sock, ulibssh2.username)) {
+				uwsgi_error("init_ssh_session()/ssh_agent_auth()");
+			}
+		} else {
+			while ((rc = libssh2_userauth_publickey_fromfile(
+						*session,
+						ulibssh2.username,
+						ulibssh2.public_key_path,
+						ulibssh2.private_key_path,
+						ulibssh2.private_key_passphrase)
+			) == LIBSSH2_ERROR_EAGAIN) {
+				waitsocket(sock, *session);
+			}
 
-		if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
-			uwsgi_log("[SSH] ssh authentication failed (bad passphrase)\n");
-			goto shutdown;
-		} else if (rc) {
-			uwsgi_error("init_ssh_session()/libssh2_userauth_publickey_fromfile()");
-			goto shutdown;
+			if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
+				uwsgi_log("[SSH] ssh authentication failed (bad passphrase)\n");
+				goto shutdown;
+			} else if (rc) {
+				uwsgi_error("init_ssh_session()/libssh2_userauth_publickey_fromfile()");
+				goto shutdown;
+			}
 		}
 	}
 
@@ -242,15 +412,17 @@ shutdown:
 }
 
 static int ssh_request_file(
-	struct wsgi_request *wsgi_req,
-	char* remoteaddr,
-	char* filepath
+		struct wsgi_request *wsgi_req,
+		char* remoteaddr,
+		char* filepath,
+		char* username,
+		char* password
 	) {
 
 	int sock = -1;
 
 	LIBSSH2_SESSION *session = NULL;
-	if (init_ssh_session(remoteaddr, &sock, &session)) {
+	if (init_ssh_session(remoteaddr, username, password, &sock, &session)) {
 		uwsgi_log("[SSH] session initialization failed.\n");
 		// uwsgi_error("ssh_request_file()/init_ssh_session()");
 		goto shutdown;
@@ -295,14 +467,15 @@ static int ssh_request_file(
 		goto sftp_shutdown;
 	}
 
-	// if (wsgi_req->if_modified_since_len) {
-	// 	time_t ims = parse_http_date(wsgi_req->if_modified_since, wsgi_req->if_modified_since_len);
-	// 	if (st->st_mtime <= ims) {
-	// 		if (uwsgi_response_prepare_headers(wsgi_req, "304 Not Modified", 16))
-	// 			return -1;
-	// 		return uwsgi_response_write_headers_do(wsgi_req);
-	// 	}
-	// }
+	if (wsgi_req->if_modified_since_len) {
+		time_t ims = uwsgi_parse_http_date(wsgi_req->if_modified_since, wsgi_req->if_modified_since_len);
+		if (file_attrs.mtime <= (unsigned long)ims) {
+			if (uwsgi_response_prepare_headers(wsgi_req, "304 Not Modified", 16) || uwsgi_response_write_headers_do(wsgi_req)) {
+				uwsgi_error("uwsgi_parse_http_date()/uwsgi_response_prepare_headers(do)()");
+			}
+			goto sftp_shutdown;
+		}
+	}
 
 	if (uwsgi_response_prepare_headers(wsgi_req, "200", 3)) {
 		uwsgi_error("ssh_request_file()/uwsgi_response_prepare_headers()");
@@ -404,7 +577,7 @@ static int ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 	char *remoteaddr = ur->data;
 	char *filepath = ur->data2;
 
-	ssh_request_file(wsgi_req, remoteaddr, filepath);
+	ssh_request_file(wsgi_req, remoteaddr, filepath, NULL, NULL);
 	return 0;
 }
 
@@ -429,7 +602,13 @@ static void register_ssh_router(void) {
 #endif
 
 static int ssh_request(struct wsgi_request *wsgi_req) {
-	if (!wsgi_req->len) {
+
+#if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
+	if (!wsgi_req->uh->pktsize)
+#else
+	if (!wsgi_req->len)
+#endif
+	{
 		uwsgi_log("Empty request. Skip.\n");
 		return -1;
 	}
@@ -439,13 +618,48 @@ static int ssh_request(struct wsgi_request *wsgi_req) {
 		return -1;
 	}
 
-	// TODO: add SSH mirroring?
-	char *remoteaddr= "127.0.0.1:2222";
-	char *filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
+	if (wsgi_req->path_info_len == 0 || wsgi_req->path_info_len > PATH_MAX) {
+		uwsgi_403(wsgi_req);
+		return UWSGI_OK;
+	}
 
-	ssh_request_file(wsgi_req, remoteaddr, filepath);
+	wsgi_req->app_id = uwsgi_get_app_id(wsgi_req, wsgi_req->appid, wsgi_req->appid_len, uwsgi.http_modifier1);
+	if (wsgi_req->app_id == -1 && !uwsgi.no_default_app && uwsgi.default_app > -1) {
+		if (uwsgi_apps[uwsgi.default_app].modifier1 == uwsgi.http_modifier1) {
+			wsgi_req->app_id = uwsgi.default_app;
+		}
+	}
 
-	free(filepath);
+	if (wsgi_req->app_id == -1) {
+		// uwsgi_log("DEBUG: 404!\n");
+		uwsgi_404(wsgi_req);
+		return UWSGI_OK;
+	}
+
+	struct uwsgi_app *ua = &uwsgi_apps[wsgi_req->app_id];
+	struct ssh_mountpoint *sshmp = ua->responder0;
+
+	if (wsgi_req->path_info_len > ua->mountpoint_len &&
+		memcmp(wsgi_req->path_info, ua->mountpoint, ua->mountpoint_len) == 0) {
+
+		ssh_request_file(
+			wsgi_req,
+			sshmp->remote,
+			wsgi_req->path_info + ua->mountpoint_len,
+			sshmp->username,
+			sshmp->password
+		);
+	} else {
+		// memcpy(filename, wsgi_req->path_info, wsgi_req->path_info_len);
+		// filename[wsgi_req->path_info_len] = 0;
+	}
+
+	// char *remoteaddr= "127.0.0.1:2222";
+	// char *filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
+
+	// ssh_request_file(wsgi_req, remoteaddr, filepath);
+
+	// free(filepath);
 	return 0;
 }
 
@@ -488,6 +702,12 @@ static int uwsgi_libssh2_init() {
 
 	if (!ulibssh2.ssh_timeout) {
 		ulibssh2.ssh_timeout = uwsgi.socket_timeout;
+	}
+
+	struct uwsgi_string_list *usl = ulibssh2.mountpoints;
+	while (usl) {
+		ssh_add_mountpoint(usl->value, usl->len);
+		usl = usl->next;
 	}
 
 	return 0;
