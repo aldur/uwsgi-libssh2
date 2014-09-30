@@ -57,9 +57,7 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 	return 0;
 }
 
-static int ssh_agent_auth(LIBSSH2_SESSION *session, char* username) {
-	// TODO: Test me!
-
+static int ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* username) {
 	LIBSSH2_AGENT *agent = libssh2_agent_init(session);
 
 	if (!agent) {
@@ -84,28 +82,31 @@ static int ssh_agent_auth(LIBSSH2_SESSION *session, char* username) {
 	    rc = libssh2_agent_get_identity(agent, &identity, prev_identity);
 
 	    if (rc == 1) {
-            uwsgi_log("SSH agent couldn't continue authentication.\n");
+            uwsgi_log("[SSH] agent couldn't continue authentication.\n");
             goto shutdown;
 	    } else if (rc < 0) {
 	        uwsgi_error("ssh_agent_auth()/libssh2_agent_get_identity()");
 	        goto shutdown;
 	    }
 
-	    if (libssh2_agent_userauth(agent, username, identity)) {
-	    	uwsgi_log("SSH agent failed authenticating user %s with public key %s\n",
+	    while ((rc = libssh2_agent_userauth(agent, username, identity)) == LIBSSH2_ERROR_EAGAIN) {
+	    	if (waitsocket(sock, session)) {
+	    		goto shutdown;
+	    	}
+		}
+
+	    if (rc) {
+	    	uwsgi_log("[SSH] agent failed authenticating user %s with public key %s\n",
 	    		username, identity->comment);
 	    } else {
-	    	// we're done!
 	        break;
 	    }
 	    prev_identity = identity;
 	}
 
-
 	/* We're authenticated now. */
 	libssh2_agent_disconnect(agent);
 	libssh2_agent_free(agent);
-
 	return 0;
 
 shutdown:
@@ -188,7 +189,7 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 		free(remoteaddr_str);
 
 		if (check != LIBSSH2_KNOWNHOST_CHECK_MATCH) {
-			uwsgi_log("Remote fingerprint check failed!\n");
+			uwsgi_log("[SSH] Remote fingerprint check failed!\n");
 			libssh2_knownhost_free(nh);
 			goto shutdown;
 		}
@@ -209,7 +210,7 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 			goto shutdown;
 		}
 	} else if (ulibssh2.auth_ssh_agent) {
-		if (ssh_agent_auth(*session, ulibssh2.username)) {
+		if (ssh_agent_auth(*session, sock, ulibssh2.username)) {
 			uwsgi_error("init_ssh_session()/ssh_agent_auth()");
 		}
 	} else {
@@ -222,7 +223,11 @@ static int init_ssh_session(char* remoteaddr, int *socket_fd, LIBSSH2_SESSION **
 		) == LIBSSH2_ERROR_EAGAIN) {
 			waitsocket(sock, *session);
 		}
-		if (rc) {
+
+		if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
+			uwsgi_log("[SSH] ssh authentication failed (bad passphrase)\n");
+			goto shutdown;
+		} else if (rc) {
 			uwsgi_error("init_ssh_session()/libssh2_userauth_publickey_fromfile()");
 			goto shutdown;
 		}
@@ -246,7 +251,7 @@ static int ssh_request_file(
 
 	LIBSSH2_SESSION *session = NULL;
 	if (init_ssh_session(remoteaddr, &sock, &session)) {
-		uwsgi_log("SSH session initialization failed.\n");
+		uwsgi_log("[SSH] session initialization failed.\n");
 		// uwsgi_error("ssh_request_file()/init_ssh_session()");
 		goto shutdown;
 	}
@@ -257,7 +262,9 @@ static int ssh_request_file(
 
 		if (!sftp_session) {
 			if (libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
-				waitsocket(sock, session);
+				if (waitsocket(sock, session)) {
+					goto shutdown;
+				}
 			} else {
 				uwsgi_error("ssh_request_file()/libssh2_sftp_init()");
 				goto shutdown;
@@ -269,7 +276,9 @@ static int ssh_request_file(
 	LIBSSH2_SFTP_ATTRIBUTES file_attrs;
 	int rc;
 	while ((rc = libssh2_sftp_stat(sftp_session, filepath, &file_attrs)) == LIBSSH2_ERROR_EAGAIN) {
-		waitsocket(sock, session);
+		if (waitsocket(sock, session)) {
+			goto shutdown;
+		}
 	}
 
 	if (rc < 0) {
@@ -329,7 +338,9 @@ static int ssh_request_file(
 				uwsgi_error("ssh_request_file()/libssh2_sftp_open()");
 				goto sftp_shutdown;
 			} else {
-				waitsocket(sock, session);
+				if (waitsocket(sock, session)) {
+					goto shutdown;
+				}
 			}
 		}
 	} while (!sftp_handle);
@@ -342,7 +353,9 @@ static int ssh_request_file(
 		rc = libssh2_sftp_read(sftp_handle, buffer, buffer_size);
 
 		if (rc == LIBSSH2_ERROR_EAGAIN) {
-			waitsocket(sock, session);
+			if (waitsocket(sock, session)) {
+				goto shutdown;
+			}
 		} else if (rc < 0) {
 			uwsgi_error("ssh_request_file()/libssh2_sftp_read()");
 			break;
@@ -356,7 +369,9 @@ static int ssh_request_file(
 	}
 
 	while ((rc = libssh2_sftp_close(sftp_handle)) == LIBSSH2_ERROR_EAGAIN) {
-		waitsocket(sock, session);
+		if (waitsocket(sock, session)) {
+			goto shutdown;
+		}
 	};
 	if (rc < 0) {
 		uwsgi_error("ssh_request_file()/libssh2_sftp_close()");
@@ -364,7 +379,9 @@ static int ssh_request_file(
 
 sftp_shutdown:
 	while ((rc = libssh2_sftp_shutdown(sftp_session)) == LIBSSH2_ERROR_EAGAIN) {
-		waitsocket(sock, session);
+		if (waitsocket(sock, session)) {
+			goto shutdown;
+		}
 	};
 	if (rc < 0) {
 		uwsgi_error("ssh_request_file()/libssh2_sftp_shutdown()");
@@ -372,7 +389,9 @@ sftp_shutdown:
 
 shutdown:
 	while (libssh2_session_disconnect(session, "Normal Shutdown, thank you!") == LIBSSH2_ERROR_EAGAIN) {
-		waitsocket(sock, session);
+		if (waitsocket(sock, session)) {
+			goto shutdown;
+		}
 	}
 	libssh2_session_free(session);
 	close(sock);
@@ -438,12 +457,12 @@ static int uwsgi_libssh2_init() {
 	}
 
 	if (!ulibssh2.username) {
-		uwsgi_log("SSH authentication needs a username!");
+		uwsgi_log("[SSH] authentication needs a username!");
 		exit(1);
 	}
 
 	if (ulibssh2.auth_pw && !ulibssh2.password) {
-		uwsgi_log("SSH password authentication needs a password!");
+		uwsgi_log("[SSH] password authentication needs a password!");
 		exit(1);
 	}
 
