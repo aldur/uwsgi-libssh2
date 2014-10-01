@@ -6,6 +6,8 @@ extern struct uwsgi_server uwsgi;
 
 #define SSH_DEFAULT_PORT 22
 
+struct uwsgi_plugin libssh2_plugin;
+
 struct uwsgi_libssh2 {
 	int auth_pw;
 	int auth_ssh_agent;
@@ -20,13 +22,6 @@ struct uwsgi_libssh2 {
 	char *ssh_custom_agent;
 	struct uwsgi_string_list *mountpoints;
 } ulibssh2;
-
-struct ssh_mountpoint {
-	char *mountpoint;
-	char *remote;
-	char *username;
-	char *password;
-};
 
 #if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
 // uWSGI < 2.1
@@ -138,65 +133,97 @@ static struct uwsgi_option libssh2_options[] = {
 	UWSGI_END_OF_OPTIONS
 };
 
-static void ssh_add_mountpoint(char *arg, size_t arg_len) {
+static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	// --ssh-mount mountpoint=/foo,remote=127.0.0.1:2222,user=vagrant,password=vagrant
 
-	struct ssh_mountpoint *sshmp = uwsgi_calloc(sizeof(struct ssh_mountpoint));
+	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
+        uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
+        exit(1);
+	}
+
+	char *mountpoint = NULL;
+	char *remote = NULL;
+	char *username = NULL;
+	char *password = NULL;
 
 	if (uwsgi_kvlist_parse(arg, arg_len, ',', '=',
-			"mountpoint", &sshmp->mountpoint,
-			"remote", &sshmp->remote,
-			"user", &sshmp->username,
-			"password", &sshmp->password,
+			"mountpoint", &mountpoint,
+			"remote", &remote,
+			"username", &username,
+			"password", &password,
 			NULL)
 		){
 		uwsgi_log("[SSH] unable to parse ssh mountpoint definition\n");
 		goto shutdown;
 	}
 
+	if (!mountpoint || !remote) {
+		uwsgi_log("[SSH] mount requires a mountpoint and a remote.\n");
+		goto shutdown;
+	}
+
 	time_t now = uwsgi_now();
-	uwsgi_log("[SSH] mounting %s on %s\n", sshmp->remote, sshmp->mountpoint);
+	uwsgi_log("[SSH] mounting %s on %s.\n", remote, mountpoint);
 
 	int id = uwsgi_apps_cnt;
+
 	struct uwsgi_app *ua = uwsgi_add_app(
 		id,
 		uwsgi.http_modifier1,
-		sshmp->mountpoint,
-		strlen(sshmp->mountpoint),
+		mountpoint,
+		strlen(mountpoint),
 		NULL,
 		NULL
 	);
 
 	if (!ua) {
-		uwsgi_log("[SSH] unable to mount %s\n", sshmp->mountpoint);
+		uwsgi_log("[SSH] unable to mount %s\n", mountpoint);
 		goto shutdown;
 	}
 
-	ua->responder0 = sshmp;
+	uwsgi_emulate_cow_for_apps(id);
+
+	ua->responder0 = remote;
+	ua->responder1 = username;
+	ua->responder2 = password;
+
+	// uwsgi_log("DEBUG: %p, %s, %p, %s, %p, %s\n",
+	// 	ua->responder0, ua->responder0, ua->responder1, ua->responder1, ua->responder2, ua->responder2);
+
 	ua->started_at = now;
 	ua->startup_time = uwsgi_now() - now;
-	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %p\n", id, sshmp->remote, (int) ua->startup_time, sshmp->mountpoint);
+	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %s\n", id, remote, (int) ua->startup_time, mountpoint);
 
 	return;
 
 shutdown:
-	free(sshmp);
+	// TODO: Do I need to free the responder strings?
 	exit(1);
 }
 
-static int waitsocket(int socket_fd, LIBSSH2_SESSION *session) {
+static void uwsgi_ssh_init_apps() {
+	struct uwsgi_string_list *usl = ulibssh2.mountpoints;
+	while (usl) {
+		uwsgi_ssh_add_mountpoint(usl->value, usl->len);
+		usl = usl->next;
+	}
+
+	return;
+}
+
+static int uwsgi_ssh_waitsocket(int socket_fd, LIBSSH2_SESSION *session) {
 	int dir = libssh2_session_block_directions(session);
 
 	if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
 		if (uwsgi.wait_read_hook(socket_fd, ulibssh2.ssh_timeout) < 0) {
-			uwsgi_error("waitsocket()/wait_read_hook()");
+			uwsgi_error("uwsgi_ssh_waitsocket()/wait_read_hook()");
 			return -1;
 		}
 	}
 
 	if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
 		if (uwsgi.wait_write_hook(socket_fd, ulibssh2.ssh_timeout) < 0) {
-			uwsgi_error("waitsocket()/wait_write_hook()");
+			uwsgi_error("uwsgi_ssh_waitsocket()/wait_write_hook()");
 			return -1;
 		}
 	}
@@ -204,21 +231,21 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session) {
 	return 0;
 }
 
-static int ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* username) {
+static int uwsgi_ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* username) {
 	LIBSSH2_AGENT *agent = libssh2_agent_init(session);
 
 	if (!agent) {
-		uwsgi_error("ssh_agent_auth()/libssh2_agent_init()");
+		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_init()");
 	    goto shutdown;
 	}
 
 	if (libssh2_agent_connect(agent)) {
-		uwsgi_error("ssh_agent_auth()/libssh2_agent_connect()")
+		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_connect()")
 	    goto shutdown;
 	}
 
 	if (libssh2_agent_list_identities(agent)) {
-		uwsgi_error("ssh_agent_auth()/libssh2_agent_list_identities()")
+		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_list_identities()")
 	    goto shutdown;
 	}
 
@@ -232,12 +259,12 @@ static int ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* username) {
             uwsgi_log("[SSH] agent couldn't continue authentication.\n");
             goto shutdown;
 	    } else if (rc < 0) {
-	        uwsgi_error("ssh_agent_auth()/libssh2_agent_get_identity()");
+	        uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_get_identity()");
 	        goto shutdown;
 	    }
 
 	    while ((rc = libssh2_agent_userauth(agent, username, identity)) == LIBSSH2_ERROR_EAGAIN) {
-	    	if (waitsocket(sock, session)) {
+	    	if (uwsgi_ssh_waitsocket(sock, session)) {
 	    		goto shutdown;
 	    	}
 		}
@@ -263,7 +290,7 @@ shutdown:
 	return -1;
 }
 
-static int init_ssh_session(
+static int uwsgi_init_ssh_session(
 		char* remoteaddr,
 		char* username,
 		char* password,
@@ -272,48 +299,48 @@ static int init_ssh_session(
 
 	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
 	if (sock < 0) {
-		uwsgi_error("init_ssh_session()/uwsgi_connect()");
+		uwsgi_error("uwsgi_init_ssh_session()/uwsgi_connect()");
 		return 1;
 	}
 
 	int rc = libssh2_init(0);
 	if (rc) {
-		uwsgi_error("init_ssh_session()/libssh2_init()");
+		uwsgi_error("uwsgi_init_ssh_session()/libssh2_init()");
 		goto shutdown;
 	}
 
 	*session = libssh2_session_init();
 	if (!session) {
-		uwsgi_error("init_ssh_session()/libssh2_session_init()");
+		uwsgi_error("uwsgi_init_ssh_session()/libssh2_session_init()");
 		goto shutdown;
 	}
 
 	libssh2_session_set_blocking(*session, 0);
 
 	while ((rc = libssh2_session_handshake(*session, sock)) == LIBSSH2_ERROR_EAGAIN) {
-		waitsocket(sock, *session);
+		uwsgi_ssh_waitsocket(sock, *session);
 	}
 	if (rc) {
-		uwsgi_error("init_ssh_session()/libssh2_session_handshake()");
+		uwsgi_error("uwsgi_init_ssh_session()/libssh2_session_handshake()");
 		goto shutdown;
 	}
 
 	if (ulibssh2.check_remote_fingerpint) {
 		LIBSSH2_KNOWNHOSTS *nh = libssh2_knownhost_init(*session);
 		if (!nh) {
-			uwsgi_error("init_ssh_session()/libssh2_knownhost_init()");
+			uwsgi_error("uwsgi_init_ssh_session()/libssh2_knownhost_init()");
 			goto shutdown;
 		}
 
 		if (libssh2_knownhost_readfile(nh, ulibssh2.known_hosts_path, LIBSSH2_KNOWNHOST_FILE_OPENSSH) < 0) {
-			uwsgi_error("init_ssh_session()/libssh2_knownhost_readfile()");
+			uwsgi_error("uwsgi_init_ssh_session()/libssh2_knownhost_readfile()");
 		}
 
 		size_t len;
 		int type;
 		const char *fingerprint = libssh2_session_hostkey(*session, &len, &type);
 		if (!fingerprint) {
-			uwsgi_error("init_ssh_session()/libssh2_session_hostkey()");
+			uwsgi_error("uwsgi_init_ssh_session()/libssh2_session_hostkey()");
 			libssh2_knownhost_free(nh);
 			goto shutdown;
 		}
@@ -357,11 +384,11 @@ static int init_ssh_session(
 						username,
 						password)
 				) == LIBSSH2_ERROR_EAGAIN) {
-				waitsocket(sock, *session);
+				uwsgi_ssh_waitsocket(sock, *session);
 			}
 
 			if (rc) {
-				uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
+				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_password()");
 				goto shutdown;
 			}
 		}
@@ -372,15 +399,15 @@ static int init_ssh_session(
 						ulibssh2.username,
 						ulibssh2.password)
 				) == LIBSSH2_ERROR_EAGAIN) {
-				waitsocket(sock, *session);
+				uwsgi_ssh_waitsocket(sock, *session);
 			}
 			if (rc) {
-				uwsgi_error("init_ssh_session()/libssh2_userauth_password()");
+				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_password()");
 				goto shutdown;
 			}
 		} else if (ulibssh2.auth_ssh_agent) {
-			if (ssh_agent_auth(*session, sock, ulibssh2.username)) {
-				uwsgi_error("init_ssh_session()/ssh_agent_auth()");
+			if (uwsgi_ssh_agent_auth(*session, sock, ulibssh2.username)) {
+				uwsgi_error("uwsgi_init_ssh_session()/uwsgi_ssh_agent_auth()");
 			}
 		} else {
 			while ((rc = libssh2_userauth_publickey_fromfile(
@@ -390,14 +417,14 @@ static int init_ssh_session(
 						ulibssh2.private_key_path,
 						ulibssh2.private_key_passphrase)
 			) == LIBSSH2_ERROR_EAGAIN) {
-				waitsocket(sock, *session);
+				uwsgi_ssh_waitsocket(sock, *session);
 			}
 
 			if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
 				uwsgi_log("[SSH] ssh authentication failed (bad passphrase)\n");
 				goto shutdown;
 			} else if (rc) {
-				uwsgi_error("init_ssh_session()/libssh2_userauth_publickey_fromfile()");
+				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_publickey_fromfile()");
 				goto shutdown;
 			}
 		}
@@ -411,7 +438,7 @@ shutdown:
 	return 1;
 }
 
-static int ssh_request_file(
+static int uwsgi_ssh_request_file(
 		struct wsgi_request *wsgi_req,
 		char* remoteaddr,
 		char* filepath,
@@ -420,11 +447,13 @@ static int ssh_request_file(
 	) {
 
 	int sock = -1;
+	int return_status = 0;
 
 	LIBSSH2_SESSION *session = NULL;
-	if (init_ssh_session(remoteaddr, username, password, &sock, &session)) {
+	if (uwsgi_init_ssh_session(remoteaddr, username, password, &sock, &session)) {
 		uwsgi_log("[SSH] session initialization failed.\n");
-		// uwsgi_error("ssh_request_file()/init_ssh_session()");
+		// uwsgi_error("uwsgi_ssh_request_file()/uwsgi_init_ssh_session()");
+		return_status = 500;
 		goto shutdown;
 	}
 
@@ -434,11 +463,13 @@ static int ssh_request_file(
 
 		if (!sftp_session) {
 			if (libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
-				if (waitsocket(sock, session)) {
+				if (uwsgi_ssh_waitsocket(sock, session)) {
+					return_status = 500;
 					goto shutdown;
 				}
 			} else {
-				uwsgi_error("ssh_request_file()/libssh2_sftp_init()");
+				uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_init()");
+				return_status = 500;
 				goto shutdown;
 			}
 		}
@@ -448,7 +479,8 @@ static int ssh_request_file(
 	LIBSSH2_SFTP_ATTRIBUTES file_attrs;
 	int rc;
 	while ((rc = libssh2_sftp_stat(sftp_session, filepath, &file_attrs)) == LIBSSH2_ERROR_EAGAIN) {
-		if (waitsocket(sock, session)) {
+		if (uwsgi_ssh_waitsocket(sock, session)) {
+			return_status = 500;
 			goto shutdown;
 		}
 	}
@@ -457,13 +489,15 @@ static int ssh_request_file(
 		// If it fails, requested file could not exist.
 		if (rc == LIBSSH2_ERROR_SFTP_PROTOCOL) {
 			if (libssh2_sftp_last_error(sftp_session) == LIBSSH2_FX_NO_SUCH_FILE) {
-				uwsgi_404(wsgi_req);
+				// uwsgi_404(wsgi_req);
 			}
+			return_status = 404;
 			goto sftp_shutdown;
 		} else {
-			uwsgi_error("ssh_request_file()/libssh2_sftp_stat()");
-			uwsgi_500(wsgi_req);
+			uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_stat()");
+			// uwsgi_500(wsgi_req);
 		}
+		return_status = 500;
 		goto sftp_shutdown;
 	}
 
@@ -473,22 +507,26 @@ static int ssh_request_file(
 			if (uwsgi_response_prepare_headers(wsgi_req, "304 Not Modified", 16) || uwsgi_response_write_headers_do(wsgi_req)) {
 				uwsgi_error("uwsgi_parse_http_date()/uwsgi_response_prepare_headers(do)()");
 			}
+			return_status = 500;
 			goto sftp_shutdown;
 		}
 	}
 
 	if (uwsgi_response_prepare_headers(wsgi_req, "200", 3)) {
-		uwsgi_error("ssh_request_file()/uwsgi_response_prepare_headers()");
+		uwsgi_error("uwsgi_ssh_request_file()/uwsgi_response_prepare_headers()");
+		return_status = 500;
 		goto sftp_shutdown;
 	}
 
 	if (uwsgi_response_add_content_length(wsgi_req, file_attrs.filesize)) {
-		uwsgi_error("ssh_request_file()/uwsgi_response_add_content_length()");
+		uwsgi_error("uwsgi_ssh_request_file()/uwsgi_response_add_content_length()");
+		return_status = 500;
 		goto sftp_shutdown;
 	}
 
 	if (uwsgi_response_add_last_modified(wsgi_req, file_attrs.mtime)) {
-		uwsgi_error("ssh_request_file()/uwsgi_response_add_last_modified()");
+		uwsgi_error("uwsgi_ssh_request_file()/uwsgi_response_add_last_modified()");
+		return_status = 500;
 		goto sftp_shutdown;
 	}
 
@@ -496,7 +534,7 @@ static int ssh_request_file(
 	char *mime_type = uwsgi_get_mime_type(filepath, strlen(filepath), &mime_type_len);
 	if (mime_type) {
 		if (uwsgi_response_add_content_type(wsgi_req, mime_type, mime_type_len)) {
-			uwsgi_error("ssh_request_file()/uwsgi_response_add_content_type()");
+			uwsgi_error("uwsgi_ssh_request_file()/uwsgi_response_add_content_type()");
 			// goto sftp_shutdown;
 		}
 	}
@@ -508,11 +546,13 @@ static int ssh_request_file(
 
 		if (!sftp_handle) {
 			if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
-				uwsgi_error("ssh_request_file()/libssh2_sftp_open()");
+				uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_open()");
+				return_status = 500;
 				goto sftp_shutdown;
 			} else {
-				if (waitsocket(sock, session)) {
-					goto shutdown;
+				if (uwsgi_ssh_waitsocket(sock, session)) {
+					return_status = 500;
+					goto sftp_shutdown;
 				}
 			}
 		}
@@ -526,82 +566,119 @@ static int ssh_request_file(
 		rc = libssh2_sftp_read(sftp_handle, buffer, buffer_size);
 
 		if (rc == LIBSSH2_ERROR_EAGAIN) {
-			if (waitsocket(sock, session)) {
-				goto shutdown;
+			if (uwsgi_ssh_waitsocket(sock, session)) {
+				return_status = 500;
+				goto sftp_shutdown;
 			}
 		} else if (rc < 0) {
-			uwsgi_error("ssh_request_file()/libssh2_sftp_read()");
+			uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_read()");
 			break;
 		} else {
 			read_size += rc;
 			if (uwsgi_response_write_body_do(wsgi_req, buffer, rc)) {
-				uwsgi_error("ssh_request_file()/uwsgi_response_write_body_do()");
+				uwsgi_error("uwsgi_ssh_request_file()/uwsgi_response_write_body_do()");
 				break;
 			}
 		}
 	}
 
 	while ((rc = libssh2_sftp_close(sftp_handle)) == LIBSSH2_ERROR_EAGAIN) {
-		if (waitsocket(sock, session)) {
-			goto shutdown;
+		if (uwsgi_ssh_waitsocket(sock, session)) {
+			return_status = 500;
+			goto sftp_shutdown;
 		}
 	};
 	if (rc < 0) {
-		uwsgi_error("ssh_request_file()/libssh2_sftp_close()");
+		uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_close()");
 	}
 
 sftp_shutdown:
 	while ((rc = libssh2_sftp_shutdown(sftp_session)) == LIBSSH2_ERROR_EAGAIN) {
-		if (waitsocket(sock, session)) {
-			goto shutdown;
-		}
+		uwsgi_ssh_waitsocket(sock, session);
 	};
 	if (rc < 0) {
-		uwsgi_error("ssh_request_file()/libssh2_sftp_shutdown()");
+		uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_shutdown()");
 	}
 
 shutdown:
 	while (libssh2_session_disconnect(session, "Normal Shutdown, thank you!") == LIBSSH2_ERROR_EAGAIN) {
-		if (waitsocket(sock, session)) {
-			goto shutdown;
-		}
+		uwsgi_ssh_waitsocket(sock, session);
 	}
 	libssh2_session_free(session);
 	close(sock);
 	libssh2_exit();
-	return 0;
+	return return_status;
 }
 
 #ifdef UWSGI_ROUTING
-static int ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	char *remoteaddr = ur->data;
-	char *filepath = ur->data2;
+static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+	// ssh:127.0.0.1:2222/tmp/foo.txt,ssh:127.0.0.1:2222/tmp/foobis.txt
 
-	ssh_request_file(wsgi_req, remoteaddr, filepath, NULL, NULL);
-	return 0;
+	char *comma = strchr(ur->data, ',');
+	char *slash = NULL;
+	char *remote = ur->data;
+	char *filepath = NULL;
+
+	int return_status = -1;
+
+	while ((comma = strchr(ur->data, ',')) != NULL) {
+		*comma = 0;
+
+		slash = strchr(remote, '/');
+		if (slash) {
+			*slash = 0;
+			remote = ur->data;
+			filepath = uwsgi_concat2("/", slash + 1);
+		}
+
+		if ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)) == 0) {
+			break;
+		} else {
+			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism...\n",
+				remote, filepath, return_status);
+		}
+
+		remote = comma + 1;
+		free(filepath);
+	}
+
+	slash = strchr(remote, '/');
+	if (slash) {
+		*slash = 0;
+		remote = ur->data;
+		filepath = uwsgi_concat2("/", slash + 1);
+	}
+
+	if ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)) == 0) {
+		free(filepath);
+		return 0;
+	} else {
+		free(filepath);
+
+		if (return_status == 404) {
+			uwsgi_404(wsgi_req);
+		} else if (return_status == 500) {
+			uwsgi_500(wsgi_req);
+		}
+
+		return 1;
+	}
 }
 
 static int ssh_router(struct uwsgi_route *ur, char *args) {
-	ur->func = ssh_routing;
+	ur->func = uwsgi_ssh_routing;
 	ur->data = args;
 	ur->data_len = strlen(args);
 
-	char *comma = strchr(ur->data, ',');
-	if (comma) {
-		*comma = 0;
-		ur->data_len = strlen(ur->data);
-		ur->data2 = comma + 1;
-		ur->data2_len = strlen(ur->data2);
-	}
 	return 0;
 }
 
-static void register_ssh_router(void) {
+static void uwsgi_register_ssh_router(void) {
 	uwsgi_register_router("ssh", ssh_router);
 }
 #endif
 
-static int ssh_request(struct wsgi_request *wsgi_req) {
+static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 
 #if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
 	if (!wsgi_req->uh->pktsize)
@@ -614,7 +691,7 @@ static int ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	if (uwsgi_parse_vars(wsgi_req)) {
-		uwsgi_error("ssh_request()/uwsgi_parse_vars()");
+		uwsgi_error("uwsgi_ssh_request()/uwsgi_parse_vars()");
 		return -1;
 	}
 
@@ -631,25 +708,35 @@ static int ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	if (wsgi_req->app_id == -1) {
-		// uwsgi_log("DEBUG: 404!\n");
 		uwsgi_404(wsgi_req);
 		return UWSGI_OK;
 	}
 
 	struct uwsgi_app *ua = &uwsgi_apps[wsgi_req->app_id];
-	struct ssh_mountpoint *sshmp = ua->responder0;
+
+	char *remote = (char *) ua->responder0;
+	char *username = (char *) ua->responder1;
+	char *password = (char *) ua->responder2;
+
+	// uwsgi_log("DEBUG: %d\n", ua->modifier1);
+	// uwsgi_log("DEBUG: %p %p %p!\n", ua->responder0, ua->responder1, ua->responder2);
 
 	if (wsgi_req->path_info_len > ua->mountpoint_len &&
 		memcmp(wsgi_req->path_info, ua->mountpoint, ua->mountpoint_len) == 0) {
 
-		ssh_request_file(
+		char* filepath = uwsgi_strncopy(wsgi_req->path_info + ua->mountpoint_len, wsgi_req->path_info_len - ua->mountpoint_len);
+
+		uwsgi_ssh_request_file(
 			wsgi_req,
-			sshmp->remote,
-			wsgi_req->path_info + ua->mountpoint_len,
-			sshmp->username,
-			sshmp->password
+			remote,
+			filepath,
+			username,
+			password
 		);
+
+		free(filepath);
 	} else {
+		// uwsgi_log("DEBUG: REQUEST BIS!\n");
 		// memcpy(filename, wsgi_req->path_info, wsgi_req->path_info_len);
 		// filename[wsgi_req->path_info_len] = 0;
 	}
@@ -657,7 +744,7 @@ static int ssh_request(struct wsgi_request *wsgi_req) {
 	// char *remoteaddr= "127.0.0.1:2222";
 	// char *filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
 
-	// ssh_request_file(wsgi_req, remoteaddr, filepath);
+	// uwsgi_ssh_request_file(wsgi_req, remoteaddr, filepath);
 
 	// free(filepath);
 	return 0;
@@ -671,6 +758,7 @@ static int uwsgi_libssh2_init() {
 	}
 
 	if (!ulibssh2.username) {
+		// FIXME: made me more flexible!
 		uwsgi_log("[SSH] authentication needs a username!");
 		exit(1);
 	}
@@ -704,12 +792,6 @@ static int uwsgi_libssh2_init() {
 		ulibssh2.ssh_timeout = uwsgi.socket_timeout;
 	}
 
-	struct uwsgi_string_list *usl = ulibssh2.mountpoints;
-	while (usl) {
-		ssh_add_mountpoint(usl->value, usl->len);
-		usl = usl->next;
-	}
-
 	return 0;
 }
 
@@ -717,8 +799,9 @@ struct uwsgi_plugin libssh2_plugin = {
 	.name = "libssh2",
 	.options = libssh2_options,
 	.init = uwsgi_libssh2_init,
-	.request = ssh_request,
+	.init_apps = uwsgi_ssh_init_apps,
+	.request = uwsgi_ssh_request,
 #ifdef UWSGI_ROUTING
-	.on_load = register_ssh_router,
+	.on_load = uwsgi_register_ssh_router,
 #endif
 };
