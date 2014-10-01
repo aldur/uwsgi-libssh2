@@ -487,17 +487,12 @@ static int uwsgi_ssh_request_file(
 
 	if (rc < 0) {
 		// If it fails, requested file could not exist.
-		if (rc == LIBSSH2_ERROR_SFTP_PROTOCOL) {
-			if (libssh2_sftp_last_error(sftp_session) == LIBSSH2_FX_NO_SUCH_FILE) {
-				// uwsgi_404(wsgi_req);
-			}
-			return_status = 404;
-			goto sftp_shutdown;
+		if (rc == LIBSSH2_ERROR_SFTP_PROTOCOL && libssh2_sftp_last_error(sftp_session) == LIBSSH2_FX_NO_SUCH_FILE) {
+				return_status = 404;
 		} else {
 			uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_stat()");
-			// uwsgi_500(wsgi_req);
+			return_status = 500;
 		}
-		return_status = 500;
 		goto sftp_shutdown;
 	}
 
@@ -612,25 +607,27 @@ shutdown:
 
 #ifdef UWSGI_ROUTING
 static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	// ssh:127.0.0.1:2222/tmp/foo.txt,ssh:127.0.0.1:2222/tmp/foobis.txt
+	// ssh:127.0.0.1:2222/tmp/foo.txt,127.0.0.1:2222/tmp/foobis.txt
 
-	char *comma = strchr(ur->data, ',');
+	char *comma = NULL;
 	char *slash = NULL;
-	char *remote = ur->data;
+	char *remote = uwsgi_str(ur->data);
+	char *remote_copy = remote;
 	char *filepath = NULL;
 
 	int return_status = -1;
 
-	while ((comma = strchr(ur->data, ',')) != NULL) {
+	while ((comma = strchr(remote, ',')) != NULL) {
 		*comma = 0;
 
 		slash = strchr(remote, '/');
 		if (slash) {
 			*slash = 0;
-			remote = ur->data;
+			// remote = ur->data;
 			filepath = uwsgi_concat2("/", slash + 1);
 		}
 
+		uwsgi_log("DEBUG: remote - %s, filepath - %s.\n", remote, filepath);
 		if ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)) == 0) {
 			break;
 		} else {
@@ -645,24 +642,26 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 	slash = strchr(remote, '/');
 	if (slash) {
 		*slash = 0;
-		remote = ur->data;
+		// remote = ur->data;
 		filepath = uwsgi_concat2("/", slash + 1);
 	}
 
-	if ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)) == 0) {
-		free(filepath);
-		return 0;
-	} else {
-		free(filepath);
+	uwsgi_log("DEBUG: remote bis - %s, filepath bis - %s.\n", remote, filepath);
 
-		if (return_status == 404) {
-			uwsgi_404(wsgi_req);
-		} else if (return_status == 500) {
-			uwsgi_500(wsgi_req);
-		}
+	switch ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)))
+	{
+	    case 404:
+	        uwsgi_404(wsgi_req);
+	        break;
 
-		return 1;
+	    case 500:
+	    default:
+	        uwsgi_500(wsgi_req);
 	}
+
+	free(filepath);
+	free(remote_copy);
+	return UWSGI_OK;
 }
 
 static int ssh_router(struct uwsgi_route *ur, char *args) {
