@@ -611,7 +611,7 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 
 	char *comma = NULL;
 	char *slash = NULL;
-	char *remote = uwsgi_str(ur->data);
+	char *remote = uwsgi_concat2(ur->data, ",");
 	char *remote_copy = remote;
 	char *filepath = NULL;
 
@@ -623,13 +623,15 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 		slash = strchr(remote, '/');
 		if (slash) {
 			*slash = 0;
-			// remote = ur->data;
 			filepath = uwsgi_concat2("/", slash + 1);
+		} else {
+			uwsgi_log("[SSH] skipping malformed route %s to %s.", remote, filepath);
+			continue;
 		}
 
-		uwsgi_log("DEBUG: remote - %s, filepath - %s.\n", remote, filepath);
-		if ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)) == 0) {
-			break;
+		if (!(return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL))) {
+			free(filepath);
+			goto end;
 		} else {
 			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism...\n",
 				remote, filepath, return_status);
@@ -639,17 +641,16 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 		free(filepath);
 	}
 
-	slash = strchr(remote, '/');
-	if (slash) {
-		*slash = 0;
-		// remote = ur->data;
-		filepath = uwsgi_concat2("/", slash + 1);
-	}
+	// slash = strchr(remote, '/');
+	// if (slash) {
+	// 	*slash = 0;
+	// 	filepath = uwsgi_concat2("/", slash + 1);
+	// } else {
+	// 	uwsgi_log("[SSH] skipping malformed route %s to %s.", remote, filepath);
+	// 	goto end;
+	// }
 
-	uwsgi_log("DEBUG: remote bis - %s, filepath bis - %s.\n", remote, filepath);
-
-	switch ((return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL)))
-	{
+	switch (return_status) {
 	    case 404:
 	        uwsgi_404(wsgi_req);
 	        break;
@@ -659,7 +660,7 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 	        uwsgi_500(wsgi_req);
 	}
 
-	free(filepath);
+end:
 	free(remote_copy);
 	return UWSGI_OK;
 }
