@@ -5,7 +5,6 @@ extern struct uwsgi_server uwsgi;
 #include <libssh2_sftp.h>
 
 #define SSH_DEFAULT_PORT 22
-#define MAX_PASSWORD_LEN 64
 
 struct uwsgi_plugin libssh2_plugin;
 
@@ -608,6 +607,14 @@ static int uwsgi_ssh_request_file(
 #ifdef UWSGI_ROUTING
 static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 	// ssh:127.0.0.1:2222/tmp/foo.txt,127.0.0.1:2222/tmp/foobis.txt
+
+	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
+	uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
+	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
+	if (!ub) {
+		uwsgi_error("uwsgi_ssh_routing()/uwsgi_routing_translate()");
+	}
+	uwsgi_log("DEBUG: %s\n", ub->buf);
 
 	char *comma = NULL;
 	char *slash = NULL;
