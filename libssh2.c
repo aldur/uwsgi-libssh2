@@ -5,6 +5,7 @@ extern struct uwsgi_server uwsgi;
 #include <libssh2_sftp.h>
 
 #define SSH_DEFAULT_PORT 22
+#define MAX_PASSWORD_LEN 64
 
 struct uwsgi_plugin libssh2_plugin;
 
@@ -19,7 +20,6 @@ struct uwsgi_libssh2 {
 	int check_remote_fingerpint;
 	char *known_hosts_path;
 	int ssh_timeout;
-	char *ssh_custom_agent;
 	struct uwsgi_string_list *mountpoints;
 } ulibssh2;
 
@@ -128,7 +128,6 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-check-remote-fingerpint", no_argument, 0, "enable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.check_remote_fingerpint, 0},
 	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
 	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
-	{"ssh-custom-agent", required_argument, 0, "ssh agent used to ask the users the ssh password", uwsgi_opt_set_str, &ulibssh2.ssh_custom_agent, 0},
 	{"ssh-mount", required_argument, 0, "virtual mount the specified ssh volume in a uri", uwsgi_opt_add_string_list, &ulibssh2.mountpoints, UWSGI_OPT_MIME},
 	UWSGI_END_OF_OPTIONS
 };
@@ -169,7 +168,7 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 
 	struct uwsgi_app *ua = uwsgi_add_app(
 		id,
-		uwsgi.http_modifier1,
+		libssh2_plugin.modifier1,
 		mountpoint,
 		strlen(mountpoint),
 		NULL,
@@ -181,11 +180,11 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 		goto shutdown;
 	}
 
-	uwsgi_emulate_cow_for_apps(id);
-
 	ua->responder0 = remote;
 	ua->responder1 = username;
 	ua->responder2 = password;
+
+	uwsgi_emulate_cow_for_apps(id);
 
 	// uwsgi_log("DEBUG: %p, %s, %p, %s, %p, %s\n",
 	// 	ua->responder0, ua->responder0, ua->responder1, ua->responder1, ua->responder2, ua->responder2);
@@ -197,7 +196,6 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	return;
 
 shutdown:
-	// TODO: Do I need to free the responder strings?
 	exit(1);
 }
 
@@ -283,7 +281,7 @@ static int uwsgi_ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* userna
 	libssh2_agent_free(agent);
 	return 0;
 
-shutdown:
+	shutdown:
 
 	libssh2_agent_disconnect(agent);
 	libssh2_agent_free(agent);
@@ -291,11 +289,11 @@ shutdown:
 }
 
 static int uwsgi_init_ssh_session(
-		char* remoteaddr,
-		char* username,
-		char* password,
-		int *socket_fd,
-		LIBSSH2_SESSION **session) {
+	char* remoteaddr,
+	char* username,
+	char* password,
+	int *socket_fd,
+	LIBSSH2_SESSION **session) {
 
 	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
 	if (sock < 0) {
@@ -433,17 +431,18 @@ static int uwsgi_init_ssh_session(
 	*socket_fd = sock;
 	return 0;
 
-shutdown:
+	shutdown:
+
 	close(sock);
 	return 1;
 }
 
 static int uwsgi_ssh_request_file(
-		struct wsgi_request *wsgi_req,
-		char* remoteaddr,
-		char* filepath,
-		char* username,
-		char* password
+	struct wsgi_request *wsgi_req,
+	char* remoteaddr,
+	char* filepath,
+	char* username,
+	char* password
 	) {
 
 	int sock = -1;
@@ -452,7 +451,6 @@ static int uwsgi_ssh_request_file(
 	LIBSSH2_SESSION *session = NULL;
 	if (uwsgi_init_ssh_session(remoteaddr, username, password, &sock, &session)) {
 		uwsgi_log("[SSH] session initialization failed.\n");
-		// uwsgi_error("uwsgi_ssh_request_file()/uwsgi_init_ssh_session()");
 		return_status = 500;
 		goto shutdown;
 	}
@@ -587,15 +585,17 @@ static int uwsgi_ssh_request_file(
 		uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_close()");
 	}
 
-sftp_shutdown:
+	sftp_shutdown:
+
 	while ((rc = libssh2_sftp_shutdown(sftp_session)) == LIBSSH2_ERROR_EAGAIN) {
 		uwsgi_ssh_waitsocket(sock, session);
-	};
+	}
 	if (rc < 0) {
 		uwsgi_error("uwsgi_ssh_request_file()/libssh2_sftp_shutdown()");
 	}
 
-shutdown:
+	shutdown:
+
 	while (libssh2_session_disconnect(session, "Normal Shutdown, thank you!") == LIBSSH2_ERROR_EAGAIN) {
 		uwsgi_ssh_waitsocket(sock, session);
 	}
@@ -633,22 +633,13 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 			free(filepath);
 			goto end;
 		} else {
-			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism...\n",
+			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism (if any)...\n",
 				remote, filepath, return_status);
 		}
 
 		remote = comma + 1;
 		free(filepath);
 	}
-
-	// slash = strchr(remote, '/');
-	// if (slash) {
-	// 	*slash = 0;
-	// 	filepath = uwsgi_concat2("/", slash + 1);
-	// } else {
-	// 	uwsgi_log("[SSH] skipping malformed route %s to %s.", remote, filepath);
-	// 	goto end;
-	// }
 
 	switch (return_status) {
 	    case 404:
@@ -660,7 +651,8 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 	        uwsgi_500(wsgi_req);
 	}
 
-end:
+	end:
+
 	free(remote_copy);
 	return UWSGI_OK;
 }
@@ -700,9 +692,9 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 		return UWSGI_OK;
 	}
 
-	wsgi_req->app_id = uwsgi_get_app_id(wsgi_req, wsgi_req->appid, wsgi_req->appid_len, uwsgi.http_modifier1);
+	wsgi_req->app_id = uwsgi_get_app_id(wsgi_req, wsgi_req->appid, wsgi_req->appid_len, libssh2_plugin.modifier1);
 	if (wsgi_req->app_id == -1 && !uwsgi.no_default_app && uwsgi.default_app > -1) {
-		if (uwsgi_apps[uwsgi.default_app].modifier1 == uwsgi.http_modifier1) {
+		if (uwsgi_apps[uwsgi.default_app].modifier1 == libssh2_plugin.modifier1) {
 			wsgi_req->app_id = uwsgi.default_app;
 		}
 	}
@@ -736,7 +728,6 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 
 		free(filepath);
 	} else {
-		// uwsgi_log("DEBUG: REQUEST BIS!\n");
 		// memcpy(filename, wsgi_req->path_info, wsgi_req->path_info_len);
 		// filename[wsgi_req->path_info_len] = 0;
 	}
@@ -757,9 +748,8 @@ static int uwsgi_libssh2_init() {
 		uwsgi_error("uwsgi_libssh2_init()/getenv()");
 	}
 
-	if (!ulibssh2.username) {
-		// FIXME: made me more flexible!
-		uwsgi_log("[SSH] authentication needs a username!");
+	if (!ulibssh2.mountpoints && !ulibssh2.username) {
+		uwsgi_log("[SSH] you need to specify amountpoint or a username!");
 		exit(1);
 	}
 
@@ -797,6 +787,7 @@ static int uwsgi_libssh2_init() {
 
 struct uwsgi_plugin libssh2_plugin = {
 	.name = "libssh2",
+	.modifier1 = 0,
 	.options = libssh2_options,
 	.init = uwsgi_libssh2_init,
 	.init_apps = uwsgi_ssh_init_apps,
