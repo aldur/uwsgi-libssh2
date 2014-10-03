@@ -29,11 +29,61 @@ struct uwsgi_libssh2 {
 } ulibssh2;
 
 struct uwsgi_ssh_mountpoint {
-	char *user;
+	char *mountpoint;
+	char *username;
 	char *password;
 	char *remote;
 	char *path;
 };
+
+int uwsgi_ssh_url_parser(char *url, struct uwsgi_ssh_mountpoint **usm) {
+	// ssh://username[:password]@host:port/path
+	if (!url) {
+		return -1;
+	}
+
+	if (!memcmp(url, "ssh://", 6)) {
+		url += 6;
+
+		// remote path
+		char *slash = strchr(url, '/');
+
+		if (slash) {
+			*slash = 0;
+			(*usm)->path = uwsgi_concat2("/", slash + 1);
+		} else {
+			uwsgi_log("[SSH] malformed ssh url (path)\n");
+			return -1;
+		}
+
+		char *at = strchr(url, '@');
+
+		if (at) {
+			*at = 0;
+
+			char *colon = strchr(url, ':');
+
+			if (colon) {
+				*colon = 0;
+				(*usm)->password = uwsgi_str(colon + 1);
+			}
+			(*usm)->username = uwsgi_str(url);
+		} else {
+			uwsgi_log("[SSH] malformed ssh url (username)\n");
+			return -1;
+		}
+
+		(*usm)->remote = uwsgi_str(at + 1);
+	}
+
+	// uwsgi_log("DEBUG: \
+	// 	username: %s, \
+	// 	password: %s, \
+	// 	remote: %s, \
+	// 	path: %s\n", (*usm)->username, (*usm)->password, (*usm)->remote, (*usm)->path);
+
+	return 0;
+}
 
 static struct uwsgi_option libssh2_options[] = {
 	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
@@ -52,65 +102,61 @@ static struct uwsgi_option libssh2_options[] = {
 };
 
 static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
-	// --ssh-mount mountpoint=/foo,remote=127.0.0.1:2222,user=vagrant,password=vagrant
+	// --ssh-mount mountpoint=/foo,remote=ssh://user[:password]@host:port/path
 
 	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
 		uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
 		exit(1);
 	}
 
-	char *mountpoint = NULL;
-	char *remote = NULL;
-	char *username = NULL;
-	char *password = NULL;
+	struct uwsgi_ssh_mountpoint *usm = uwsgi_calloc(sizeof(struct uwsgi_ssh_mountpoint));
 
+	char *remote_url = NULL;
 	if (uwsgi_kvlist_parse(arg, arg_len, ',', '=',
-			"mountpoint", &mountpoint,
-			"remote", &remote,
-			"username", &username,
-			"password", &password,
+			"mountpoint", &usm->mountpoint,
+			"remote", &remote_url,
 			NULL)
 		){
 		uwsgi_log("[SSH] unable to parse ssh mountpoint definition\n");
 		goto shutdown;
 	}
 
-	if (!mountpoint || !remote) {
+	if (uwsgi_ssh_url_parser(remote_url, &usm)) {
+		uwsgi_error("uwsgi_ssh_add_mountpoint()/uwsgi_ssh_url_parser()");
+		goto shutdown;
+	}
+
+	if (!usm->mountpoint || !usm->remote) {
 		uwsgi_log("[SSH] mount requires a mountpoint and a remote.\n");
 		goto shutdown;
 	}
 
 	time_t now = uwsgi_now();
-	uwsgi_log("[SSH] mounting %s on %s.\n", remote, mountpoint);
+	uwsgi_log("[SSH] mounting %s%s on %s.\n", usm->remote, usm->path, usm->mountpoint);
 
 	int id = uwsgi_apps_cnt;
 
 	struct uwsgi_app *ua = uwsgi_add_app(
 		id,
 		libssh2_plugin.modifier1,
-		mountpoint,
-		strlen(mountpoint),
+		usm->mountpoint,
+		strlen(usm->mountpoint),
 		NULL,
 		NULL
 	);
 
 	if (!ua) {
-		uwsgi_log("[SSH] unable to mount %s\n", mountpoint);
+		uwsgi_log("[SSH] unable to mount %s\n", usm->mountpoint);
 		goto shutdown;
 	}
 
-	ua->responder0 = remote;
-	ua->responder1 = username;
-	ua->responder2 = password;
+	ua->responder0 = usm;
 
 	uwsgi_emulate_cow_for_apps(id);
 
-	// uwsgi_log("DEBUG: %p, %s, %p, %s, %p, %s\n",
-	// 	ua->responder0, ua->responder0, ua->responder1, ua->responder1, ua->responder2, ua->responder2);
-
 	ua->started_at = now;
 	ua->startup_time = uwsgi_now() - now;
-	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %s\n", id, remote, (int) ua->startup_time, mountpoint);
+	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %s\n", id, usm->remote, (int) ua->startup_time, usm->mountpoint);
 
 	return;
 
@@ -379,7 +425,7 @@ static int uwsgi_ssh_request_file(
 		sftp_session = libssh2_sftp_init(session);
 
 		if (!sftp_session) {
-			if (libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
+			if ((libssh2_session_last_errno(session)) == LIBSSH2_ERROR_EAGAIN) {
 				if (uwsgi_ssh_waitsocket(sock, session)) {
 					return_status = 500;
 					goto shutdown;
@@ -526,19 +572,23 @@ static int uwsgi_ssh_request_file(
 
 #ifdef UWSGI_ROUTING
 static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	// ssh:127.0.0.1:2222/tmp/foo.txt,127.0.0.1:2222/tmp/foobis.txt
+	// ssh://127.0.0.1:2222/tmp/foo.txt,127.0.0.1:2222/tmp/foobis.txt
+
+	char *url = NULL;
 
 	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
 	uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
 	if (!ub) {
 		uwsgi_error("uwsgi_ssh_routing()/uwsgi_routing_translate()");
+		url = ur->data;
+	} else {
+		url = ub->buf;
 	}
-	uwsgi_log("DEBUG: %s\n", ub->buf);
 
 	char *comma = NULL;
 	char *slash = NULL;
-	char *remote = uwsgi_concat2(ur->data, ",");
+	char *remote = uwsgi_concat2(ub->buf, ",");
 	char *remote_copy = remote;
 	char *filepath = NULL;
 
@@ -578,16 +628,16 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 			uwsgi_500(wsgi_req);
 	}
 
-	end:
-
+end:
 	free(remote_copy);
+	uwsgi_buffer_destroy(ub);
 	return UWSGI_OK;
 }
 
 static int ssh_router(struct uwsgi_route *ur, char *args) {
 	ur->func = uwsgi_ssh_routing;
-	ur->data = args;
-	ur->data_len = strlen(args);
+	ur->data = args+2;  // skip trading ssh:// slashes
+	ur->data_len = strlen(ur->data);
 
 	return 0;
 }
@@ -632,28 +682,37 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	struct uwsgi_app *ua = &uwsgi_apps[wsgi_req->app_id];
-
-	char *remote = (char *) ua->responder0;
-	char *username = (char *) ua->responder1;
-	char *password = (char *) ua->responder2;
-
-	// uwsgi_log("DEBUG: %d\n", ua->modifier1);
-	// uwsgi_log("DEBUG: %p %p %p!\n", ua->responder0, ua->responder1, ua->responder2);
+	struct uwsgi_ssh_mountpoint *usm = (struct uwsgi_ssh_mountpoint *) ua->responder0;
 
 	if (wsgi_req->path_info_len > ua->mountpoint_len &&
 		memcmp(wsgi_req->path_info, ua->mountpoint, ua->mountpoint_len) == 0) {
 
-		char* filepath = uwsgi_strncopy(wsgi_req->path_info + ua->mountpoint_len, wsgi_req->path_info_len - ua->mountpoint_len);
+		char* filepath = uwsgi_strncopy(
+			wsgi_req->path_info + ua->mountpoint_len,
+			wsgi_req->path_info_len - ua->mountpoint_len
+		);
+		char *complete_filepath = uwsgi_concat2(usm->path, filepath);
+		free(filepath);
 
-		uwsgi_ssh_request_file(
+		int return_status = uwsgi_ssh_request_file(
 			wsgi_req,
-			remote,
-			filepath,
-			username,
-			password
+			usm->remote,
+			complete_filepath,
+			usm->username,
+			usm->password
 		);
 
-		free(filepath);
+		free(complete_filepath);
+
+		switch (return_status) {
+			case 404:
+				uwsgi_404(wsgi_req);
+				break;
+
+			case 500:
+			default:
+				uwsgi_500(wsgi_req);
+		}
 	} else {
 		// memcpy(filename, wsgi_req->path_info, wsgi_req->path_info_len);
 		// filename[wsgi_req->path_info_len] = 0;
@@ -680,7 +739,7 @@ static int uwsgi_libssh2_init() {
 		exit(1);
 	}
 
-	if (ulibssh2.auth_pw && !ulibssh2.password) {
+	if (ulibssh2.auth_pw && !ulibssh2.password &&!ulibssh2.mountpoints) {
 		uwsgi_log("[SSH] password authentication needs a password!");
 		exit(1);
 	}
