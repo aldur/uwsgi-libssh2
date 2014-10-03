@@ -1,10 +1,16 @@
 #include <uwsgi.h>
-extern struct uwsgi_server uwsgi;
 
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 
+#if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
+// uWSGI < 2.1
+#include "http_date.h"
+#endif
+
 #define SSH_DEFAULT_PORT 22
+
+extern struct uwsgi_server uwsgi;
 
 struct uwsgi_plugin libssh2_plugin;
 
@@ -22,98 +28,12 @@ struct uwsgi_libssh2 {
 	struct uwsgi_string_list *mountpoints;
 } ulibssh2;
 
-#if !defined(UWSGI_PLUGIN_API) || UWSGI_PLUGIN_API == 1
-// uWSGI < 2.1
-time_t uwsgi_parse_http_date(char *date, uint16_t len) {
-	        struct tm hdtm;
-
-	        if (len != 29 && date[3] != ',')
-	                return 0;
-
-	        hdtm.tm_mday = uwsgi_str2_num(date + 5);
-
-	        switch (date[8]) {
-	        case 'J':
-	                if (date[9] == 'a') {
-	                        hdtm.tm_mon = 0;
-	                        break;
-	                }
-
-	                if (date[9] == 'u') {
-	                        if (date[10] == 'n') {
-	                                hdtm.tm_mon = 5;
-	                                break;
-	                        }
-
-	                        if (date[10] == 'l') {
-	                                hdtm.tm_mon = 6;
-	                                break;
-	                        }
-
-	                        return 0;
-	                }
-
-	                return 0;
-
-	        case 'F':
-	                hdtm.tm_mon = 1;
-	                break;
-
-	        case 'M':
-	                if (date[9] != 'a')
-	                        return 0;
-
-	                if (date[10] == 'r') {
-	                        hdtm.tm_mon = 2;
-	                        break;
-	                }
-
-	                if (date[10] == 'y') {
-	                        hdtm.tm_mon = 4;
-	                        break;
-	                }
-
-	                return 0;
-
-	        case 'A':
-	                if (date[10] == 'r') {
-	                        hdtm.tm_mon = 3;
-	                        break;
-	                }
-	                if (date[10] == 'g') {
-	                        hdtm.tm_mon = 7;
-	                        break;
-	                }
-	                return 0;
-
-	        case 'S':
-	                hdtm.tm_mon = 8;
-	                break;
-
-	        case 'O':
-	                hdtm.tm_mon = 9;
-	                break;
-
-	        case 'N':
-	                hdtm.tm_mon = 10;
-			break;
-
-	        case 'D':
-	                hdtm.tm_mon = 11;
-	                break;
-	        default:
-	                return 0;
-	        }
-
-	        hdtm.tm_year = uwsgi_str4_num(date + 12) - 1900;
-
-	        hdtm.tm_hour = uwsgi_str2_num(date + 17);
-	        hdtm.tm_min = uwsgi_str2_num(date + 20);
-	        hdtm.tm_sec = uwsgi_str2_num(date + 23);
-
-	        return timegm(&hdtm);
-}
-#endif
+struct uwsgi_ssh_mountpoint {
+	char *user;
+	char *password;
+	char *remote;
+	char *path;
+};
 
 static struct uwsgi_option libssh2_options[] = {
 	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
@@ -135,8 +55,8 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	// --ssh-mount mountpoint=/foo,remote=127.0.0.1:2222,user=vagrant,password=vagrant
 
 	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
-        uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
-        exit(1);
+		uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
+		exit(1);
 	}
 
 	char *mountpoint = NULL;
@@ -233,46 +153,46 @@ static int uwsgi_ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* userna
 
 	if (!agent) {
 		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_init()");
-	    goto shutdown;
+		goto shutdown;
 	}
 
 	if (libssh2_agent_connect(agent)) {
 		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_connect()")
-	    goto shutdown;
+		goto shutdown;
 	}
 
 	if (libssh2_agent_list_identities(agent)) {
 		uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_list_identities()")
-	    goto shutdown;
+		goto shutdown;
 	}
 
 	struct libssh2_agent_publickey *identity, *prev_identity = NULL;
 	int rc = 0;
 
 	while (1) {
-	    rc = libssh2_agent_get_identity(agent, &identity, prev_identity);
+		rc = libssh2_agent_get_identity(agent, &identity, prev_identity);
 
-	    if (rc == 1) {
-            uwsgi_log("[SSH] agent couldn't continue authentication.\n");
-            goto shutdown;
-	    } else if (rc < 0) {
-	        uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_get_identity()");
-	        goto shutdown;
-	    }
-
-	    while ((rc = libssh2_agent_userauth(agent, username, identity)) == LIBSSH2_ERROR_EAGAIN) {
-	    	if (uwsgi_ssh_waitsocket(sock, session)) {
-	    		goto shutdown;
-	    	}
+		if (rc == 1) {
+			uwsgi_log("[SSH] agent couldn't continue authentication.\n");
+			goto shutdown;
+		} else if (rc < 0) {
+			uwsgi_error("uwsgi_ssh_agent_auth()/libssh2_agent_get_identity()");
+			goto shutdown;
 		}
 
-	    if (rc) {
-	    	uwsgi_log("[SSH] agent failed authenticating user %s with public key %s. Continuing...\n",
-	    		username, identity->comment);
-	    } else {
-	        break;
-	    }
-	    prev_identity = identity;
+		while ((rc = libssh2_agent_userauth(agent, username, identity)) == LIBSSH2_ERROR_EAGAIN) {
+			if (uwsgi_ssh_waitsocket(sock, session)) {
+				goto shutdown;
+			}
+		}
+
+		if (rc) {
+			uwsgi_log("[SSH] agent failed authenticating user %s with public key %s. Continuing...\n",
+				username, identity->comment);
+		} else {
+			break;
+		}
+		prev_identity = identity;
 	}
 
 	/* We're authenticated now. */
@@ -649,13 +569,13 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 	}
 
 	switch (return_status) {
-	    case 404:
-	        uwsgi_404(wsgi_req);
-	        break;
+		case 404:
+			uwsgi_404(wsgi_req);
+			break;
 
-	    case 500:
-	    default:
-	        uwsgi_500(wsgi_req);
+		case 500:
+		default:
+			uwsgi_500(wsgi_req);
 	}
 
 	end:
