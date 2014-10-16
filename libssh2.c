@@ -37,50 +37,49 @@ struct uwsgi_ssh_mountpoint {
 };
 
 int uwsgi_ssh_url_parser(char *url, struct uwsgi_ssh_mountpoint **usm) {
-	// ssh://username[:password]@host:port/path
-	if (!url) {
+	// [ssh://]username[:password]@host:port/path
+
+	if (!url || !(*usm)) {
 		return -1;
 	}
 
 	if (!memcmp(url, "ssh://", 6)) {
 		url += 6;
-
-		// remote path
-		char *slash = strchr(url, '/');
-
-		if (slash) {
-			*slash = 0;
-			(*usm)->path = uwsgi_concat2("/", slash + 1);
-		} else {
-			uwsgi_log("[SSH] malformed ssh url (path)\n");
-			return -1;
-		}
-
-		char *at = strchr(url, '@');
-
-		if (at) {
-			*at = 0;
-
-			char *colon = strchr(url, ':');
-
-			if (colon) {
-				*colon = 0;
-				(*usm)->password = uwsgi_str(colon + 1);
-			}
-			(*usm)->username = uwsgi_str(url);
-		} else {
-			uwsgi_log("[SSH] malformed ssh url (username)\n");
-			return -1;
-		}
-
-		(*usm)->remote = uwsgi_str(at + 1);
 	}
 
-	// uwsgi_log("DEBUG: \
-	// 	username: %s, \
-	// 	password: %s, \
-	// 	remote: %s, \
-	// 	path: %s\n", (*usm)->username, (*usm)->password, (*usm)->remote, (*usm)->path);
+	// first of all, the remote path
+	char *slash = strchr(url, '/');
+
+	if (slash) {
+		*slash = 0;
+		(*usm)->path = uwsgi_concat2("/", slash + 1);
+	} else {
+		uwsgi_log("[SSH] malformed ssh url (path)\n");
+		return -1;
+	}
+
+	// then, the user:password
+	char *at = strchr(url, '@');
+
+	if (at) {
+		*at = 0;
+
+		char *colon = strchr(url, ':');
+
+		if (colon) {
+			*colon = 0;
+			(*usm)->password = uwsgi_str(colon + 1);
+		} else {
+			(*usm)->password = NULL;  // there is no password!
+		}
+		(*usm)->username = uwsgi_str(url);
+	} else {
+		uwsgi_log("[SSH] malformed ssh url (username)\n");
+		return -1;
+	}
+
+	// and eventually, the remote host (ip:port)
+	(*usm)->remote = uwsgi_str(at + 1);
 
 	return 0;
 }
@@ -572,50 +571,42 @@ static int uwsgi_ssh_request_file(
 
 #ifdef UWSGI_ROUTING
 static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
-	// ssh://127.0.0.1:2222/tmp/foo.txt,127.0.0.1:2222/tmp/foobis.txt
+	// ssh://username[:password]@127.0.0.1:2222/tmp/foo.txt,username[:password]@127.0.0.1:2222/tmp/foobis.txt
 
-	char *url = NULL;
+	char *remote_url = NULL;
 
 	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
 	uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 	struct uwsgi_buffer *ub = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, ur->data, ur->data_len);
 	if (!ub) {
 		uwsgi_error("uwsgi_ssh_routing()/uwsgi_routing_translate()");
-		url = ur->data;
+		remote_url = ur->data;
 	} else {
-		url = ub->buf;
+		remote_url = ub->buf;
 	}
 
+	remote_url = uwsgi_concat2(remote_url, ",");
+	char *remote_pointer = remote_url;
 	char *comma = NULL;
-	char *slash = NULL;
-	char *remote = uwsgi_concat2(ub->buf, ",");
-	char *remote_copy = remote;
-	char *filepath = NULL;
-
+	struct uwsgi_ssh_mountpoint *usm = uwsgi_calloc(sizeof(struct uwsgi_ssh_mountpoint));
 	int return_status = -1;
 
-	while ((comma = strchr(remote, ',')) != NULL) {
+	while ((comma = strchr(remote_url, ',')) != NULL) {
 		*comma = 0;
-
-		slash = strchr(remote, '/');
-		if (slash) {
-			*slash = 0;
-			filepath = uwsgi_concat2("/", slash + 1);
-		} else {
-			uwsgi_log("[SSH] skipping malformed route %s to %s.", remote, filepath);
+		if (uwsgi_ssh_url_parser(remote_url, &usm)) {
+			uwsgi_log("[SSH] skipping malformed route %s.", remote_url);
+			return_status = 500;
 			continue;
 		}
 
-		if (!(return_status = uwsgi_ssh_request_file(wsgi_req, remote, filepath, NULL, NULL))) {
-			free(filepath);
+		if (!(return_status = uwsgi_ssh_request_file(wsgi_req, usm->remote, usm->path, usm->username, usm->password))) {
 			goto end;
 		} else {
 			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism (if any)...\n",
-				remote, filepath, return_status);
+				usm->remote, usm->path, return_status);
 		}
 
-		remote = comma + 1;
-		free(filepath);
+		remote_url = comma + 1;
 	}
 
 	switch (return_status) {
@@ -629,14 +620,19 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 	}
 
 end:
-	free(remote_copy);
+	free(remote_pointer);
 	uwsgi_buffer_destroy(ub);
 	return UWSGI_OK;
 }
 
 static int ssh_router(struct uwsgi_route *ur, char *args) {
 	ur->func = uwsgi_ssh_routing;
-	ur->data = args+2;  // skip trading ssh:// slashes
+
+	if (memcmp(ur->data, "//", 2)) {
+		ur->data = args+2;  // skip trailing ssh:// slashes
+	} else {
+		ur->data = args;
+	}
 	ur->data_len = strlen(ur->data);
 
 	return 0;
@@ -718,12 +714,6 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 		// filename[wsgi_req->path_info_len] = 0;
 	}
 
-	// char *remoteaddr= "127.0.0.1:2222";
-	// char *filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
-
-	// uwsgi_ssh_request_file(wsgi_req, remoteaddr, filepath);
-
-	// free(filepath);
 	return 0;
 }
 
@@ -735,13 +725,13 @@ static int uwsgi_libssh2_init() {
 	}
 
 	if (!ulibssh2.mountpoints && !ulibssh2.username) {
-		uwsgi_log("[SSH] you need to specify amountpoint or a username!");
-		exit(1);
+		uwsgi_log("[SSH] you need to specify at least a mountpoint or a username!");
+		// exit(1);
 	}
 
 	if (ulibssh2.auth_pw && !ulibssh2.password &&!ulibssh2.mountpoints) {
 		uwsgi_log("[SSH] password authentication needs a password!");
-		exit(1);
+		// exit(1);
 	}
 
 	if (!ulibssh2.private_key_path) {
