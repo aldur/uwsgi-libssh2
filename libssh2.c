@@ -22,7 +22,7 @@ struct uwsgi_libssh2 {
 	char *public_key_path;
 	char *private_key_path;
 	char *private_key_passphrase;
-	int check_remote_fingerpint;
+	int disable_remote_fingerprint_check;
 	char *known_hosts_path;
 	int ssh_timeout;
 	struct uwsgi_string_list *mountpoints;
@@ -93,7 +93,7 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file (default ~/.ssh/id_rsa.pub)", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
 	{"ssh-private-key-path", required_argument, 0, "path of id_rsa file (default ~/.ssh/id_rsa)", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
 	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
-	{"ssh-check-remote-fingerpint", no_argument, 0, "enable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.check_remote_fingerpint, 0},
+	{"disable-ssh-remote-fingerpint-check", no_argument, 0, "disable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.disable_remote_fingerprint_check, 0},
 	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
 	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
 	{"ssh-mount", required_argument, 0, "virtual mount the specified ssh volume in a uri", uwsgi_opt_add_string_list, &ulibssh2.mountpoints, UWSGI_OPT_MIME},
@@ -287,7 +287,7 @@ static int uwsgi_init_ssh_session(
 		goto shutdown;
 	}
 
-	if (ulibssh2.check_remote_fingerpint) {
+	if (!ulibssh2.disable_remote_fingerprint_check) {
 		LIBSSH2_KNOWNHOSTS *nh = libssh2_knownhost_init(*session);
 		if (!nh) {
 			uwsgi_error("uwsgi_init_ssh_session()/libssh2_knownhost_init()");
@@ -593,8 +593,9 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 
 	while ((comma = strchr(remote_url, ',')) != NULL) {
 		*comma = 0;
+
 		if (uwsgi_ssh_url_parser(remote_url, &usm)) {
-			uwsgi_log("[SSH] skipping malformed route %s.", remote_url);
+			uwsgi_log("[SSH] skipping malformed route %s\n", remote_url);
 			return_status = 500;
 			continue;
 		}
@@ -628,13 +629,13 @@ end:
 static int ssh_router(struct uwsgi_route *ur, char *args) {
 	ur->func = uwsgi_ssh_routing;
 
-	if (memcmp(ur->data, "//", 2)) {
+	if (!memcmp(args, "//", 2)) {
 		ur->data = args+2;  // skip trailing ssh:// slashes
 	} else {
 		ur->data = args;
 	}
-	ur->data_len = strlen(ur->data);
 
+	ur->data_len = strlen(ur->data);
 	return 0;
 }
 
@@ -744,10 +745,6 @@ static int uwsgi_libssh2_init() {
 
 	if (!ulibssh2.private_key_passphrase) {
 		ulibssh2.private_key_passphrase = "";
-	}
-
-	if (!ulibssh2.check_remote_fingerpint) {
-		ulibssh2.check_remote_fingerpint = 1;
 	}
 
 	if (!ulibssh2.known_hosts_path) {
