@@ -1,3 +1,4 @@
 .uwsgi_plugins_builder/
 *.so
 *.pyc
+__pycache__
