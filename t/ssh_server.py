@@ -23,7 +23,7 @@ PORT = 2200
 EXIT_EVENT = Event()
 
 # setup logging
-# paramiko.util.log_to_file('demo_server.log')
+paramiko.util.log_to_file('demo_server.log')
 server_key = paramiko.RSAKey(filename='server_id_rsa')
 
 
