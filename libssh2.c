@@ -36,6 +36,22 @@ struct uwsgi_ssh_mountpoint {
 	char *path;
 };
 
+static struct uwsgi_option libssh2_options[] = {
+	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
+	{"ssh-password-auth", no_argument, 0, "enable ssh password authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_pw, 0},
+	{"ssh-agent", no_argument, 0, "enable ssh-agent authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_ssh_agent, 0},
+	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
+	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
+	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file (default ~/.ssh/id_rsa.pub)", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
+	{"ssh-private-key-path", required_argument, 0, "path of id_rsa file (default ~/.ssh/id_rsa)", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
+	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
+	{"disable-ssh-remote-fingerpint-check", no_argument, 0, "disable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.disable_remote_fingerprint_check, 0},
+	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
+	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
+	{"ssh-mount", required_argument, 0, "virtual mount the specified ssh volume in a uri", uwsgi_opt_add_string_list, &ulibssh2.mountpoints, UWSGI_OPT_MIME},
+	UWSGI_END_OF_OPTIONS
+};
+
 int uwsgi_ssh_url_parser(char *url, struct uwsgi_ssh_mountpoint **usm) {
 	// [ssh://]username[:password]@host:port/path
 
@@ -73,32 +89,15 @@ int uwsgi_ssh_url_parser(char *url, struct uwsgi_ssh_mountpoint **usm) {
 			(*usm)->password = NULL;  // there is no password!
 		}
 		(*usm)->username = uwsgi_str(url);
-	} else {
-		uwsgi_log("[SSH] malformed ssh url (username)\n");
-		return -1;
-	}
 
-	// and eventually, the remote host (ip:port)
-	(*usm)->remote = uwsgi_str(at + 1);
+		// and eventually, the remote host (ip:port)
+		(*usm)->remote = uwsgi_str(at + 1);
+	} else {
+		(*usm)->remote = uwsgi_str(url);
+	}
 
 	return 0;
 }
-
-static struct uwsgi_option libssh2_options[] = {
-	{"ssh-mime", no_argument, 0, "enable mime detection over SSH sessions", uwsgi_opt_true, &uwsgi.build_mime_dict, UWSGI_OPT_MIME},
-	{"ssh-password-auth", no_argument, 0, "enable ssh password authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_pw, 0},
-	{"ssh-agent", no_argument, 0, "enable ssh-agent authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_ssh_agent, 0},
-	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
-	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
-	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file (default ~/.ssh/id_rsa.pub)", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
-	{"ssh-private-key-path", required_argument, 0, "path of id_rsa file (default ~/.ssh/id_rsa)", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
-	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
-	{"disable-ssh-remote-fingerpint-check", no_argument, 0, "disable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.disable_remote_fingerprint_check, 0},
-	{"ssh-known-hosts-path", required_argument, 0, "path to the ssh known_hosts file (default ~/.ssh/known_hosts)", uwsgi_opt_set_str, &ulibssh2.known_hosts_path, 0},
-	{"ssh-timeout", required_argument, 0, "ssh sessions socket timeout (default uwsgi socket timeout)", uwsgi_opt_set_int, &ulibssh2.ssh_timeout, 0},
-	{"ssh-mount", required_argument, 0, "virtual mount the specified ssh volume in a uri", uwsgi_opt_add_string_list, &ulibssh2.mountpoints, UWSGI_OPT_MIME},
-	UWSGI_END_OF_OPTIONS
-};
 
 static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	// --ssh-mount mountpoint=/foo,remote=ssh://user[:password]@host:port/path
@@ -256,7 +255,7 @@ static int uwsgi_init_ssh_session(
 	char* remoteaddr,
 	char* username,
 	char* password,
-	int *socket_fd,
+	int* socket_fd,
 	LIBSSH2_SESSION **session) {
 
 	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
@@ -339,42 +338,64 @@ static int uwsgi_init_ssh_session(
 		libssh2_knownhost_free(nh);
 	}
 
+	// If specified, username and password are honored
 	if (username && password) {
-		if (ulibssh2.auth_pw) {
-			while ((rc = libssh2_userauth_password(
-						*session,
-						username,
-						password)
-				) == LIBSSH2_ERROR_EAGAIN) {
-				uwsgi_ssh_waitsocket(sock, *session);
-			}
-
-			if (rc) {
-				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_password()");
-				goto shutdown;
-			}
+		while ((rc = libssh2_userauth_password(
+					*session,
+					username,
+					password)
+			) == LIBSSH2_ERROR_EAGAIN) {
+			uwsgi_ssh_waitsocket(sock, *session);
 		}
-	} else {
-		if (ulibssh2.auth_pw) {
+
+		if (rc) {
+			uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_password()");
+			goto shutdown;
+		} else {
+			goto end;
+		}
+
+	// Else, let's try the fallback authentication methods:
+	} else if (username || ulibssh2.username) {
+
+		// Let's choose which username to use
+		char* auth_user = ulibssh2.username;
+		if (username) {
+			auth_user = username;
+		}
+
+		// Password authentication
+		if (ulibssh2.auth_pw && ulibssh2.password) {
 			while ((rc = libssh2_userauth_password(
 						*session,
-						ulibssh2.username,
+						auth_user,
 						ulibssh2.password)
 				) == LIBSSH2_ERROR_EAGAIN) {
 				uwsgi_ssh_waitsocket(sock, *session);
 			}
 			if (rc) {
 				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_password()");
-				goto shutdown;
+				// goto shutdown;
+			} else {
+				goto end;
 			}
-		} else if (ulibssh2.auth_ssh_agent) {
-			if (uwsgi_ssh_agent_auth(*session, sock, ulibssh2.username)) {
+		}
+
+		// SSH agent authentication
+		if (ulibssh2.auth_ssh_agent) {
+			if (uwsgi_ssh_agent_auth(*session, sock, auth_user)) {
 				uwsgi_error("uwsgi_init_ssh_session()/uwsgi_ssh_agent_auth()");
+				// goto shutdown;
+			} else {
+				goto end;
 			}
-		} else {
+		}
+
+		// Public key authentication
+		if (ulibssh2.public_key_path && ulibssh2.private_key_path && ulibssh2.private_key_passphrase) {
 			while ((rc = libssh2_userauth_publickey_fromfile(
 						*session,
-						ulibssh2.username,
+						auth_user,
 						ulibssh2.public_key_path,
 						ulibssh2.private_key_path,
 						ulibssh2.private_key_passphrase)
@@ -384,21 +405,28 @@ static int uwsgi_init_ssh_session(
 
 			if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
 				uwsgi_log("[SSH] ssh authentication failed (bad passphrase)\n");
-				goto shutdown;
+				// goto shutdown;
 			} else if (rc) {
 				uwsgi_error("uwsgi_init_ssh_session()/libssh2_userauth_publickey_fromfile()");
-				goto shutdown;
+				// goto shutdown;
+			} else {
+				goto end;
 			}
 		}
 	}
 
+
+// If we arrive here, something went wrong.
+	uwsgi_log("[SSH] session initialization failed (no authentication method worked)\n");
+shutdown:
+		close(sock);
+		return 1;
+
+// Otherwise, we're fine!
+end:
 	*socket_fd = sock;
 	return 0;
 
-	shutdown:
-
-	close(sock);
-	return 1;
 }
 
 static int uwsgi_ssh_request_file(
@@ -600,7 +628,14 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 			continue;
 		}
 
-		if (!(return_status = uwsgi_ssh_request_file(wsgi_req, usm->remote, usm->path, usm->username, usm->password))) {
+		if (!(return_status = uwsgi_ssh_request_file(
+					wsgi_req,
+					usm->remote,
+					usm->path,
+					usm->username,
+					usm->password
+		)))
+		{
 			goto end;
 		} else {
 			uwsgi_log("[SSH] route %s to %s returned %d. Engaging fail-over mechanism (if any)...\n",
@@ -727,12 +762,11 @@ static int uwsgi_libssh2_init() {
 
 	if (!ulibssh2.mountpoints && !ulibssh2.username) {
 		uwsgi_log("[SSH] you need to specify at least a mountpoint or a username!");
-		// exit(1);
 	}
 
-	if (ulibssh2.auth_pw && !ulibssh2.password &&!ulibssh2.mountpoints) {
+	if (ulibssh2.auth_pw && !ulibssh2.password) {
 		uwsgi_log("[SSH] password authentication needs a password!");
-		// exit(1);
+		exit(1);
 	}
 
 	if (!ulibssh2.private_key_path) {
