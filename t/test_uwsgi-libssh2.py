@@ -66,14 +66,18 @@ class TestUwsgiLibssh2(unittest.TestCase):
             int(os.path.getsize(os.path.join(ROOT, resource[1])))
         )
 
-    def test_mountpoint(self):
-        resource = ("/foo/bar.txt", "mnt/foo/bar.txt")
+    def test_mountpoints(self):
+        resources = [
+            ("/foo/bar.txt", "mnt/foo/bar.txt"),
+            ("/bar/user.txt", "home/bar/user.txt"),
+        ]
 
-        request = self._request_and_check_status_code(resource)
-        self.assertEqual(
-            int(request.headers['content-length']),
-            int(os.path.getsize(os.path.join(ROOT, resource[1])))
-        )
+        for resource in resources:
+            request = self._request_and_check_status_code(resource)
+            self.assertEqual(
+                int(request.headers['content-length']),
+                int(os.path.getsize(os.path.join(ROOT, resource[1])))
+            )
 
 
 if __name__ == '__main__':
