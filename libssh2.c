@@ -697,7 +697,9 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 		return -1;
 	}
 
-	if (wsgi_req->path_info_len == 0 || wsgi_req->path_info_len > PATH_MAX) {
+	if (wsgi_req->path_info_len == 0 ||
+		wsgi_req->path_info_len > PATH_MAX ||
+		wsgi_req->path_info[wsgi_req->path_info_len - 1] == '/') {
 		uwsgi_403(wsgi_req);
 		return UWSGI_OK;
 	}
