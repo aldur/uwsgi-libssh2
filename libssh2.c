@@ -148,7 +148,8 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 		goto shutdown;
 	}
 
-	ua->responder0 = usm;
+	// App storage area.
+	ua->callable = usm;
 
 	uwsgi_emulate_cow_for_apps(id);
 
@@ -442,7 +443,7 @@ static int uwsgi_ssh_request_file(
 
 	LIBSSH2_SESSION *session = NULL;
 	if (uwsgi_init_ssh_session(remoteaddr, username, password, &sock, &session)) {
-		uwsgi_log("[SSH] session initialization failed.\n");
+		uwsgi_log("[SSH] session initialization failed. Is the SSH server up?\n");
 		return_status = 500;
 		goto shutdown;
 	}
@@ -702,6 +703,7 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	wsgi_req->app_id = uwsgi_get_app_id(wsgi_req, wsgi_req->appid, wsgi_req->appid_len, libssh2_plugin.modifier1);
+
 	if (wsgi_req->app_id == -1 && !uwsgi.no_default_app && uwsgi.default_app > -1) {
 		if (uwsgi_apps[uwsgi.default_app].modifier1 == libssh2_plugin.modifier1) {
 			wsgi_req->app_id = uwsgi.default_app;
@@ -714,40 +716,44 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	struct uwsgi_app *ua = &uwsgi_apps[wsgi_req->app_id];
-	struct uwsgi_ssh_mountpoint *usm = (struct uwsgi_ssh_mountpoint *) ua->responder0;
+	struct uwsgi_ssh_mountpoint *usm = (struct uwsgi_ssh_mountpoint *) ua->callable;
+
+	char *complete_filepath = NULL;
+	char *filepath = NULL;
 
 	if (wsgi_req->path_info_len > ua->mountpoint_len &&
 		memcmp(wsgi_req->path_info, ua->mountpoint, ua->mountpoint_len) == 0) {
 
-		char* filepath = uwsgi_strncopy(
+		filepath = uwsgi_strncopy(
 			wsgi_req->path_info + ua->mountpoint_len,
 			wsgi_req->path_info_len - ua->mountpoint_len
 		);
-		char *complete_filepath = uwsgi_concat2(usm->path, filepath);
-		free(filepath);
 
-		int return_status = uwsgi_ssh_request_file(
-			wsgi_req,
-			usm->remote,
-			complete_filepath,
-			usm->username,
-			usm->password
-		);
-
-		free(complete_filepath);
-
-		switch (return_status) {
-			case 404:
-				uwsgi_404(wsgi_req);
-				break;
-
-			case 500:
-			default:
-				uwsgi_500(wsgi_req);
-		}
 	} else {
-		// memcpy(filename, wsgi_req->path_info, wsgi_req->path_info_len);
-		// filename[wsgi_req->path_info_len] = 0;
+		filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
+	}
+
+	complete_filepath = uwsgi_concat2(usm->path, filepath);
+	free(filepath);
+
+	int return_status = uwsgi_ssh_request_file(
+		wsgi_req,
+		usm->remote,
+		complete_filepath,
+		usm->username,
+		usm->password
+	);
+
+	free(complete_filepath);
+
+	switch (return_status) {
+		case 404:
+			uwsgi_404(wsgi_req);
+			break;
+
+		case 500:
+		default:
+			uwsgi_500(wsgi_req);
 	}
 
 	return 0;
@@ -758,6 +764,11 @@ static int uwsgi_libssh2_init() {
 
 	if (!home) {
 		uwsgi_error("uwsgi_libssh2_init()/getenv()");
+	}
+
+	if (ulibssh2.mountpoints) {
+		// manage_script_name needed for mountpoints
+		uwsgi.manage_script_name = 1;
 	}
 
 	if (!ulibssh2.mountpoints && !ulibssh2.username) {
