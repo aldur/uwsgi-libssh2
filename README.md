@@ -1,10 +1,11 @@
 # uwsgi-libssh2
 *Still a work in progress!*
 
-## Configuration
+# Configuration
 
-### ssh-mountpoint
-Through the `ssh-mount` flag you can mount an entire SSH remote path as a uwsgi application, by specifying the muountpoint and the ssh-url.
+## ssh-mountpoint
+The `ssh-mount` option let you mount an entire SSH remote path as a uwsgi application.
+All you need to do is to specify the muountpoint and the ssh-url.
 
 An example, as an .ini configuration entry:
 
@@ -12,14 +13,30 @@ An example, as an .ini configuration entry:
 ssh-mount = mountpoint=/foo,remote=ssh://username:password@127.0.0.1:2222/tmp
 ```
 
-### ssh-url specifications
+### ssh-mountpoint high availability
+You may want to specify different ssh-urls related to the same mountpoint as a fallback mechanism, in case something goes wrong.
+In this case, simply postpone your fallback configuration to the principal one.
+
+```ini
+; principal configuration
+ssh-mount = mountpoint=/foo,remote=ssh://username:password@127.0.0.1:2222/tmp
+; fallback #1
+ssh-mount = mountpoint=/foo,remote=ssh://username:password@remoteserver/tmp
+; fallback #2
+; ...
+```
+
+Remember: the system will fallback to the other configurations only if the initialization of an SSH session with the previouses has failed.
+In other words, the high availability will not kick-in if the requested resources are not found on the remote server, but only in case of server or configuration error.
+
+## ssh-url specifications
 The ssh-mount flag and event the SSH routing options expect, as an argument, an SSH-url, having the following syntax:
 
 ```html
 ssh://user:password@host:port/path
 ```
 
-#### Optional parameters / url formatting
+### Optional parameters / url formatting
 * The "ssh://" initial portion can be safely omitted.
     - `user:password@host:port/path`
 * The ":password" url slice can be omitted too. In this case you should provide an [alternative authentication method](#specific-ssh-authentication-methods) (public key, ssh-agent or default password).
@@ -29,13 +46,13 @@ ssh://user:password@host:port/path
 * Oh and, of course, the port can be omitted. The system will automatically fallback to the SSH default port (22).
     - `ssh://user:password@host/path`
 
-### Specific SSH authentication methods
+## SSH authentication methods
 Clear-text passwords stored in any configuration file are _improper_.
 
 As a consequence, you could set-up several alternative (and better) authentication methods.
 In case any ssh-url does not contain the password field, these methods will be automatically used.
 
-#### Public key authentication
+### Public key authentication
 You can specify your identity by using the following options:
 
 ```ini
@@ -44,14 +61,14 @@ ssh-private-key-path = foo/id_rsa ; default value ~/.ssh/id_rsa
 ssh-private-key-passphrase = yourspassphrase ; empty string by default
 ```
 
-#### SSH-agent
+### SSH-agent
 You can enable SSH-agent support by setting in your configuration:
 
 ```ini
 ssh-agent = 1  ; off by default
 ```
 
-#### Default SSH password
+### Default SSH password
 If you're a fan of SSH passwords and you're too lazy to type it in every mountpoint, you can specify a _default_ SSH password:
 
 ```ini
@@ -59,7 +76,7 @@ ssh-password-auth = 1
 ssh-password = weak
 ```
 
-#### Default SSH user
+### Default SSH user
 
 If you need a _default_ SSH user you can set in your INI file:
 ```ini
