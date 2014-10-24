@@ -34,6 +34,10 @@ struct uwsgi_ssh_mountpoint {
 	char *password;
 	char *remote;
 	char *path;
+	int ssh_agent;
+	char *pub_key_path;
+	char *priv_key_path;
+	char *priv_key_passphrase;
 	void *next;  // list of uwsgi_ssh_mountpoints (fallback!)
 };
 
@@ -101,7 +105,16 @@ int uwsgi_ssh_url_parser(char *url, struct uwsgi_ssh_mountpoint **usm) {
 }
 
 static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
-	// --ssh-mount mountpoint=/foo,remote=ssh://user[:password]@host:port/path
+	/*
+	--ssh-mount
+	Required fields:
+		mountpoint=/foo,
+		remote=ssh://user[:password]@host:port/path,
+
+	Optional fields:
+		ssh_agent=1 (actually, anything will be interpreted as true),
+		identity=pub_key_path,priv_key_path,priv_key_passphrase (passphrase is optional)
+	*/
 
 	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
 		uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
@@ -111,9 +124,14 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	struct uwsgi_ssh_mountpoint *usm = uwsgi_calloc(sizeof(struct uwsgi_ssh_mountpoint));
 
 	char *remote_url = NULL;
+	char *ssh_agent = NULL;
+	char *identity = NULL;
+
 	if (uwsgi_kvlist_parse(arg, arg_len, ',', '=',
 			"mountpoint", &usm->mountpoint,
 			"remote", &remote_url,
+			"ssh-agent", &ssh_agent,
+			"identity", &identity,
 			NULL)
 		){
 		uwsgi_log("[SSH] unable to parse ssh mountpoint definition\n");
@@ -128,6 +146,45 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	if (!usm->mountpoint || !usm->remote) {
 		uwsgi_log("[SSH] mount requires a mountpoint and a remote.\n");
 		goto shutdown;
+	}
+
+	if (ssh_agent) {
+		usm->ssh_agent = 1;
+	} else {
+		usm->ssh_agent = 0;
+	}
+
+	if (identity) {
+		char* comma = strchr(identity, ',');
+
+		if (comma) {
+			*comma = 0;
+			usm->pub_key_path = identity;
+
+			identity = comma + 1;
+			comma = strchr(identity, ',');
+
+			if (comma) {
+				*comma = 0;
+				usm->priv_key_path = identity;
+
+				identity = comma + 1;
+				comma = strchr(identity, ',');
+
+				if (comma) {
+					*comma = 0;
+					usm->priv_key_passphrase = identity;
+				}
+			} else {
+				goto bad_identity;
+			}
+		} else {
+bad_identity:
+			uwsgi_log("[SSH] bad remote identity %s. Ignoring...\n", identity);
+			usm->pub_key_path = NULL;
+			usm->priv_key_path = NULL;
+			usm->priv_key_passphrase = NULL;
+		}
 	}
 
 	int app_id = uwsgi_get_app_id(NULL, usm->mountpoint, strlen(usm->mountpoint), libssh2_plugin.modifier1);
