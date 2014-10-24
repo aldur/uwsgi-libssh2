@@ -37,7 +37,7 @@ class TestUwsgiLibssh2(unittest.TestCase):
         return request
 
     def test_sftp_transfer(self):
-        resource = ("/foo", "tmp/foo.txt")
+        resource = ("/foofirst", "tmp/foo.txt")
 
         request = self._request_and_check_status_code(resource)
         self.assertEqual(request.headers['Content-Type'], "text/plain")

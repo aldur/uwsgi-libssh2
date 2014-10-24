@@ -34,6 +34,7 @@ struct uwsgi_ssh_mountpoint {
 	char *password;
 	char *remote;
 	char *path;
+	void *next;  // list of uwsgi_ssh_mountpoints (fallback!)
 };
 
 static struct uwsgi_option libssh2_options[] = {
@@ -129,33 +130,52 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 		goto shutdown;
 	}
 
-	time_t now = uwsgi_now();
-	uwsgi_log("[SSH] mounting %s%s on %s.\n", usm->remote, usm->path, usm->mountpoint);
+	int app_id = uwsgi_get_app_id(NULL, usm->mountpoint, strlen(usm->mountpoint), libssh2_plugin.modifier1);
 
-	int id = uwsgi_apps_cnt;
+	if (app_id == -1) {
+		time_t now = uwsgi_now();
+		uwsgi_log("[SSH] mounting %s%s on %s.\n", usm->remote, usm->path, usm->mountpoint);
 
-	struct uwsgi_app *ua = uwsgi_add_app(
-		id,
-		libssh2_plugin.modifier1,
-		usm->mountpoint,
-		strlen(usm->mountpoint),
-		NULL,
-		NULL
-	);
+		int id = uwsgi_apps_cnt;
 
-	if (!ua) {
-		uwsgi_log("[SSH] unable to mount %s\n", usm->mountpoint);
-		goto shutdown;
+		struct uwsgi_app *ua = uwsgi_add_app(
+			id,
+			libssh2_plugin.modifier1,
+			usm->mountpoint,
+			strlen(usm->mountpoint),
+			NULL,
+			NULL
+		);
+
+		if (!ua) {
+			uwsgi_log("[SSH] unable to mount %s\n", usm->mountpoint);
+			goto shutdown;
+		}
+
+		// App storage area.
+		ua->callable = usm;
+
+		uwsgi_emulate_cow_for_apps(id);
+
+		ua->started_at = now;
+		ua->startup_time = uwsgi_now() - now;
+		uwsgi_log("[SSH] mountpoint %d (%s) loaded in %d seconds at %s\n",
+			id, usm->remote, (int) ua->startup_time, usm->mountpoint);
+	} else {
+		uwsgi_log("[SSH] adding %s to high availability configuration for mounpoint %s.\n",
+			usm->remote, usm->mountpoint);
+
+		struct uwsgi_app *ua = &uwsgi_apps[app_id];
+		struct uwsgi_ssh_mountpoint *usm_list = (struct uwsgi_ssh_mountpoint *) ua->callable;
+
+		while (usm_list->next) {
+			usm_list = usm_list->next;
+		}
+
+		usm_list->next = usm;
+
+		uwsgi_emulate_cow_for_apps(app_id);
 	}
-
-	// App storage area.
-	ua->callable = usm;
-
-	uwsgi_emulate_cow_for_apps(id);
-
-	ua->started_at = now;
-	ua->startup_time = uwsgi_now() - now;
-	uwsgi_log("SSH mountpoint %d (%s) loaded in %d seconds at %s\n", id, usm->remote, (int) ua->startup_time, usm->mountpoint);
 
 	return;
 
@@ -417,14 +437,14 @@ static int uwsgi_init_ssh_session(
 	}
 
 
-// If we arrive here, something went wrong.
+	// If we arrive here, something went wrong.
 	uwsgi_log("[SSH] session initialization failed (no authentication method worked)\n");
 shutdown:
 		close(sock);
 		return 1;
 
-// Otherwise, we're fine!
 end:
+	// Otherwise, we're fine!
 	*socket_fd = sock;
 	return 0;
 
@@ -688,7 +708,7 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	if (!wsgi_req->len)
 #endif
 	{
-		uwsgi_log("Empty request. Skip.\n");
+		uwsgi_log("[SSH] skipping empty request.\n");
 		return -1;
 	}
 
@@ -718,7 +738,7 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	}
 
 	struct uwsgi_app *ua = &uwsgi_apps[wsgi_req->app_id];
-	struct uwsgi_ssh_mountpoint *usm = (struct uwsgi_ssh_mountpoint *) ua->callable;
+	struct uwsgi_ssh_mountpoint *usm_list = (struct uwsgi_ssh_mountpoint *) ua->callable;
 
 	char *complete_filepath = NULL;
 	char *filepath = NULL;
@@ -735,16 +755,22 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 		filepath = uwsgi_strncopy(wsgi_req->path_info, wsgi_req->path_info_len);
 	}
 
-	complete_filepath = uwsgi_concat2(usm->path, filepath);
+	complete_filepath = uwsgi_concat2(usm_list->path, filepath);
 	free(filepath);
 
-	int return_status = uwsgi_ssh_request_file(
-		wsgi_req,
-		usm->remote,
-		complete_filepath,
-		usm->username,
-		usm->password
-	);
+	int return_status = 500;
+	struct uwsgi_ssh_mountpoint *usm = usm_list;
+
+	do {
+		return_status = uwsgi_ssh_request_file(
+			wsgi_req,
+			usm->remote,
+			complete_filepath,
+			usm->username,
+			usm->password
+		);
+
+	} while (return_status == 500 && ((usm = usm->next) != NULL));
 
 	free(complete_filepath);
 
