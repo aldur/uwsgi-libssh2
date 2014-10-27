@@ -855,11 +855,6 @@ static int uwsgi_libssh2_init() {
 		uwsgi_error("uwsgi_libssh2_init()/getenv()");
 	}
 
-	if (ulibssh2.mountpoints) {
-		// manage_script_name needed for mountpoints
-		uwsgi.manage_script_name = 1;
-	}
-
 	if (!ulibssh2.mountpoints && !ulibssh2.username) {
 		uwsgi_log("[SSH] you need to specify at least a mountpoint or a username!");
 	}
