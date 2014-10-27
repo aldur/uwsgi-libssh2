@@ -155,31 +155,26 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 	}
 
 	if (identity) {
-		char* comma = strchr(identity, ',');
+		char* semicolon = strchr(identity, ';');
 
-		if (comma) {
-			*comma = 0;
+		if (semicolon) {
+			*semicolon = 0;
 			usm->pub_key_path = identity;
 
-			identity = comma + 1;
-			comma = strchr(identity, ',');
+			identity = semicolon + 1;
+			semicolon = strchr(identity, ';');
 
-			if (comma) {
-				*comma = 0;
+			if (semicolon) {
+				*semicolon = 0;
 				usm->priv_key_path = identity;
 
-				identity = comma + 1;
-				comma = strchr(identity, ',');
-
-				if (comma) {
-					*comma = 0;
-					usm->priv_key_passphrase = identity;
-				}
+				identity = semicolon + 1;
+				usm->priv_key_passphrase = identity;
 			} else {
-				goto bad_identity;
+				usm->priv_key_path = identity;
+				usm->priv_key_passphrase = "";
 			}
 		} else {
-bad_identity:
 			uwsgi_log("[SSH] bad remote identity %s. Ignoring...\n", identity);
 			usm->pub_key_path = NULL;
 			usm->priv_key_path = NULL;
@@ -330,13 +325,11 @@ static int uwsgi_ssh_agent_auth(LIBSSH2_SESSION *session, int sock, char* userna
 }
 
 static int uwsgi_init_ssh_session(
-	char* remoteaddr,
-	char* username,
-	char* password,
+	struct uwsgi_ssh_mountpoint *usm,
 	int* socket_fd,
 	LIBSSH2_SESSION **session) {
 
-	int sock = uwsgi_connect(remoteaddr, ulibssh2.ssh_timeout, 1);
+	int sock = uwsgi_connect(usm->remote, ulibssh2.ssh_timeout, 1);
 	if (sock < 0) {
 		uwsgi_error("uwsgi_init_ssh_session()/uwsgi_connect()");
 		return 1;
@@ -384,7 +377,7 @@ static int uwsgi_init_ssh_session(
 			goto shutdown;
 		}
 
-		char *remoteaddr_str = uwsgi_str(remoteaddr);
+		char *remoteaddr_str = uwsgi_str(usm->remote);
 		char *port_str = strchr(remoteaddr_str, ':');
 		int port = SSH_DEFAULT_PORT;
 
@@ -417,11 +410,11 @@ static int uwsgi_init_ssh_session(
 	}
 
 	// If specified, username and password are honored
-	if (username && password) {
+	if (usm->username && usm->password) {
 		while ((rc = libssh2_userauth_password(
 					*session,
-					username,
-					password)
+					usm->username,
+					usm->password)
 			) == LIBSSH2_ERROR_EAGAIN) {
 			uwsgi_ssh_waitsocket(sock, *session);
 		}
@@ -434,12 +427,12 @@ static int uwsgi_init_ssh_session(
 		}
 
 	// Else, let's try the fallback authentication methods:
-	} else if (username || ulibssh2.username) {
+	} else if (usm->username || ulibssh2.username) {
 
 		// Let's choose which username to use
 		char* auth_user = ulibssh2.username;
-		if (username) {
-			auth_user = username;
+		if (usm->username) {
+			auth_user = usm->username;
 		}
 
 		// Password authentication
@@ -460,7 +453,7 @@ static int uwsgi_init_ssh_session(
 		}
 
 		// SSH agent authentication
-		if (ulibssh2.auth_ssh_agent) {
+		if (usm->ssh_agent || ulibssh2.auth_ssh_agent) {
 			if (uwsgi_ssh_agent_auth(*session, sock, auth_user)) {
 				uwsgi_error("uwsgi_init_ssh_session()/uwsgi_ssh_agent_auth()");
 				// goto shutdown;
@@ -470,13 +463,30 @@ static int uwsgi_init_ssh_session(
 		}
 
 		// Public key authentication
-		if (ulibssh2.public_key_path && ulibssh2.private_key_path && ulibssh2.private_key_passphrase) {
+		if ((ulibssh2.public_key_path && ulibssh2.private_key_path && ulibssh2.private_key_passphrase) ||
+			(usm->pub_key_path && usm->priv_key_path && usm->priv_key_passphrase)) {
+
+			char *actual_pubk_path = ulibssh2.public_key_path;
+			if (usm->pub_key_path) {
+				actual_pubk_path = usm->pub_key_path;
+			}
+
+			char *actual_privk_path = ulibssh2.private_key_path;
+			if (usm->priv_key_path) {
+				actual_privk_path = usm->priv_key_path;
+			}
+
+			char *actual_passphrase = ulibssh2.private_key_passphrase;
+			if (usm->priv_key_passphrase) {
+				actual_passphrase = usm->priv_key_passphrase;
+			}
+
 			while ((rc = libssh2_userauth_publickey_fromfile(
 						*session,
 						auth_user,
-						ulibssh2.public_key_path,
-						ulibssh2.private_key_path,
-						ulibssh2.private_key_passphrase)
+						actual_pubk_path,
+						actual_privk_path,
+						actual_passphrase)
 			) == LIBSSH2_ERROR_EAGAIN) {
 				uwsgi_ssh_waitsocket(sock, *session);
 			}
@@ -509,17 +519,15 @@ end:
 
 static int uwsgi_ssh_request_file(
 	struct wsgi_request *wsgi_req,
-	char* remoteaddr,
 	char* filepath,
-	char* username,
-	char* password
+	struct uwsgi_ssh_mountpoint *usm
 	) {
 
 	int sock = -1;
 	int return_status = 0;
 
 	LIBSSH2_SESSION *session = NULL;
-	if (uwsgi_init_ssh_session(remoteaddr, username, password, &sock, &session)) {
+	if (uwsgi_init_ssh_session(usm, &sock, &session)) {
 		uwsgi_log("[SSH] session initialization failed. Is the SSH server up?\n");
 		return_status = 500;
 		goto shutdown;
@@ -708,10 +716,8 @@ static int uwsgi_ssh_routing(struct wsgi_request *wsgi_req, struct uwsgi_route *
 
 		if (!(return_status = uwsgi_ssh_request_file(
 					wsgi_req,
-					usm->remote,
 					usm->path,
-					usm->username,
-					usm->password
+					usm
 		)))
 		{
 			goto end;
@@ -821,10 +827,8 @@ static int uwsgi_ssh_request(struct wsgi_request *wsgi_req) {
 	do {
 		return_status = uwsgi_ssh_request_file(
 			wsgi_req,
-			usm->remote,
 			complete_filepath,
-			usm->username,
-			usm->password
+			usm
 		);
 
 	} while (return_status == 500 && ((usm = usm->next) != NULL));
