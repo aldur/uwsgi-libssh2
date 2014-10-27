@@ -47,7 +47,7 @@ static struct uwsgi_option libssh2_options[] = {
 	{"ssh-agent", no_argument, 0, "enable ssh-agent authentication (default off)", uwsgi_opt_true, &ulibssh2.auth_ssh_agent, 0},
 	{"ssh-user", required_argument, 0, "username to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.username, 0},
 	{"ssh-password", required_argument, 0, "password to be used in each ssh session", uwsgi_opt_set_str, &ulibssh2.password, 0},
-	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file (default ~/.ssh/id_rsa.pub)", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
+	{"ssh-public-key-path", required_argument, 0, "path of id_rsa.pub file, needed only if not using OpenSSL", uwsgi_opt_set_str, &ulibssh2.public_key_path, 0},
 	{"ssh-private-key-path", required_argument, 0, "path of id_rsa file (default ~/.ssh/id_rsa)", uwsgi_opt_set_str, &ulibssh2.private_key_path, 0},
 	{"ssh-private-key-passphrase", required_argument, 0, "passphrase to use when decoding the privatekey", uwsgi_opt_set_str, &ulibssh2.private_key_passphrase, 0},
 	{"disable-ssh-remote-fingerpint-check", no_argument, 0, "disable remote fingerpint checking (default on)", uwsgi_opt_true, &ulibssh2.disable_remote_fingerprint_check, 0},
@@ -113,7 +113,8 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 
 	Optional fields:
 		ssh_agent=1 (actually, anything will be interpreted as true),
-		identity=pub_key_path,priv_key_path,priv_key_passphrase (passphrase is optional)
+		identity=priv_key_path;priv_key_passphrase (passphrase is optional)
+		public_identity=pub_key_path (needed only if not using OpenSSL)
 	*/
 
 	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
@@ -132,6 +133,7 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 			"remote", &remote_url,
 			"ssh-agent", &ssh_agent,
 			"identity", &identity,
+			"public_identity", &usm->pub_key_path,
 			NULL)
 		){
 		uwsgi_log("[SSH] unable to parse ssh mountpoint definition\n");
@@ -158,28 +160,12 @@ static void uwsgi_ssh_add_mountpoint(char *arg, size_t arg_len) {
 		char* semicolon = strchr(identity, ';');
 
 		if (semicolon) {
-			*semicolon = 0;
-			usm->pub_key_path = identity;
-
-			identity = semicolon + 1;
-			semicolon = strchr(identity, ';');
-
-			if (semicolon) {
-				*semicolon = 0;
-				usm->priv_key_path = identity;
-
-				identity = semicolon + 1;
-				usm->priv_key_passphrase = identity;
-			} else {
-				usm->priv_key_path = identity;
-				usm->priv_key_passphrase = "";
-			}
+			usm->priv_key_passphrase = semicolon + 1;
 		} else {
-			uwsgi_log("[SSH] bad remote identity %s. Ignoring...\n", identity);
-			usm->pub_key_path = NULL;
-			usm->priv_key_path = NULL;
-			usm->priv_key_passphrase = NULL;
+			usm->priv_key_path = identity;
+			usm->priv_key_passphrase = "";
 		}
+		usm->priv_key_path = identity;
 	}
 
 	int app_id = uwsgi_get_app_id(NULL, usm->mountpoint, strlen(usm->mountpoint), libssh2_plugin.modifier1);
@@ -463,8 +449,8 @@ static int uwsgi_init_ssh_session(
 		}
 
 		// Public key authentication
-		if ((ulibssh2.public_key_path && ulibssh2.private_key_path && ulibssh2.private_key_passphrase) ||
-			(usm->pub_key_path && usm->priv_key_path && usm->priv_key_passphrase)) {
+		if ((ulibssh2.private_key_path && ulibssh2.private_key_passphrase) ||
+			(usm->priv_key_path && usm->priv_key_passphrase)) {
 
 			char *actual_pubk_path = ulibssh2.public_key_path;
 			if (usm->pub_key_path) {
@@ -866,10 +852,6 @@ static int uwsgi_libssh2_init() {
 
 	if (!ulibssh2.private_key_path) {
 		ulibssh2.private_key_path = uwsgi_concat2(home, "/.ssh/id_rsa");
-	}
-
-	if (!ulibssh2.public_key_path) {
-		ulibssh2.public_key_path = uwsgi_concat2(home, "/.ssh/id_rsa.pub");
 	}
 
 	if (!ulibssh2.private_key_passphrase) {

@@ -6,6 +6,8 @@ It supports clear-text authentication, public key identity and ssh-agent.
 
 You can specify such resources by using one or more ssh-mountpoints or by using a custom routing rule.
 
+__Note:__ you can use this plugin in both multi-thread and multi-process asynchronous mode.
+
 # Configuration
 
 ## ssh-mountpoint
@@ -26,8 +28,12 @@ manage-script-name = 1
 ### ssh-mountpoint alternative authentication methods
 In addition to the standard username/password fields in the ssh-url, you can specify the following alternative [authentication methods](#ssh-authentication-methods).
 ```ini
-; Custom identity: PublicKeyPath;PrivateKeyPath(;Passphrase)
+; Custom identity: PrivateKeyPath(;Passphrase)
 ssh-mount = mountpoint=/foo,remote=ssh://username:password@127.0.0.1:2222/tmp,identity=t/id_rsa.pub;t/id_rsa;secret
+
+; Custom identity with PublicKey 
+; (needed only if libssh2 has not been built against OpenSSL)
+ssh-mount = mountpoint=/foo,remote=ssh://username:password@127.0.0.1:2222/tmp,identity=t/id_rsa.pub;t/id_rsa;secret,public-identity=t/id_rsa.pub
 
 ; SSH-agent:
 ssh-mount = mountpoint=/foo,remote=ssh://test@127.0.0.1:2200/mnt/foo,ssh-agent=1
@@ -47,7 +53,7 @@ ssh-mount = mountpoint=/foo,remote=ssh://username:password@remoteserver/tmp
 ; ...
 ```
 
-__Remember:__ the system will fallback to the other configurations only if the initialization of an SSH session with the previouses has failed.
+__Remember:__ the system will fallback to the other configurations only if the initialization of an SSH session with the previous has failed.
 In other words, the high availability will not kick-in if the requested resources are not found on the remote server, but only in case of server or configuration error.
 
 ## ssh-url
@@ -77,9 +83,11 @@ These methods will be automatically and globally used if not differently specifi
 You can specify your identity by using the following options:
 
 ```ini
-ssh-public-key-path = foo/id_rsa.pub  ; default value ~/.ssh/id_rsa.pub
 ssh-private-key-path = foo/id_rsa ; default value ~/.ssh/id_rsa
 ssh-private-key-passphrase = yourspassphrase ; empty string by default
+
+; If you haven't built libssh2 against OpenSSL you should specify the public key too:
+ssh-public-key-path = foo/id_rsa.pub
 ```
 
 ### SSH-agent
@@ -141,7 +149,7 @@ In this example, each request to /mp/ will be mapped to the correspondent resour
 
 __Note:__ this plugin does not modify the known hosts file. As a consequence, you should edit it manually or disable the fingeprint check (potentially insecure against MITM attacks).
 
-## Testing
+# Testing
 Tests are located in the `t` folder.
 In order to run them you should install the `paramiko` and `requests` python modules (you can use pip).
 
